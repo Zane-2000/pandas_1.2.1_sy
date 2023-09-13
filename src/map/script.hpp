@@ -1,0 +1,2615 @@
+﻿// Copyright (c) rAthena Dev Teams - Licensed under GNU GPL
+// For more information, see LICENCE in the main folder
+
+#ifndef SCRIPT_HPP
+#define SCRIPT_HPP
+
+#include <ryml_std.hpp>
+#include <ryml.hpp>
+
+#include <common/database.hpp>
+#include <common/cbasetypes.hpp>
+#include <common/db.hpp>
+#include <common/mmo.hpp>
+#include <common/timer.hpp>
+
+#define NUM_WHISPER_VAR 10
+
+///////////////////////////////////////////////////////////////////////////////
+//## TODO possible enhancements: [FlavioJS]
+// - 'callfunc' supporting labels in the current npc "::LabelName"
+// - 'callfunc' supporting labels in other npcs "NpcName::LabelName"
+// - 'function FuncName;' function declarations reverting to global functions
+//   if local label isn't found
+// - join callfunc and callsub's functionality
+// - remove dynamic allocation in add_word()
+// - remove GETVALUE / SETVALUE
+// - clean up the set_reg / set_val / setd_sub mess
+// - detect invalid label references at parse-time
+
+//
+// struct script_state* st;
+//
+
+/// Returns the script_data at the target index	返回目标索引处的script_data
+#define script_getdata(st,i) ( &((st)->stack->stack_data[(st)->start + (i)]) )
+/// Returns if the stack contains data at the target index
+#define script_hasdata(st,i) ( (st)->end > (st)->start + (i) )
+/// Returns the index of the last data in the stack
+#define script_lastdata(st) ( (st)->end - (st)->start - 1 )
+/// Pushes an int into the stack
+#define script_pushint(st,val) push_val((st)->stack, C_INT, (val))
+/// Pushes an int64 into the stack
+#define script_pushint64( st, val ) push_val2( (st)->stack, C_INT, val, nullptr )
+/// Pushes a string into the stack (script engine frees it automatically)
+#define script_pushstr(st,val) push_str((st)->stack, C_STR, (val))
+/// Pushes a copy of a string into the stack
+#define script_pushstrcopy(st,val) push_str((st)->stack, C_STR, aStrdup(val))
+/// Pushes a constant string into the stack (must never change or be freed)
+#define script_pushconststr(st,val) push_str((st)->stack, C_CONSTSTR, const_cast<char *>(val))
+/// Pushes a nil into the stack
+#define script_pushnil(st) push_val((st)->stack, C_NOP, 0)
+/// Pushes a copy of the data in the target index
+#define script_pushcopy(st,i) push_copy((st)->stack, (st)->start + (i))
+
+#define script_isstring(st,i) data_isstring(get_val(st, script_getdata(st,i)))
+#define script_isint(st,i) data_isint(get_val(st, script_getdata(st,i)))
+
+#define script_getnum(st,val) conv_num(st, script_getdata(st,val))
+#define script_getnum64(st,val) conv_num64(st, script_getdata(st,val))
+#define script_getstr(st,val) conv_str(st, script_getdata(st,val))
+#define script_getref(st,val) ( script_getdata(st,val)->ref )
+// Returns name of currently running function
+#define script_getfuncname(st) ( st->funcname )
+
+// Note: "top" functions/defines use indexes relative to the top of the stack
+//       -1 is the index of the data at the top
+
+/// Returns the script_data at the target index relative to the top of the stack
+#define script_getdatatop(st,i) ( &((st)->stack->stack_data[(st)->stack->sp + (i)]) )
+/// Pushes a copy of the data in the target index relative to the top of the stack
+#define script_pushcopytop(st,i) push_copy((st)->stack, (st)->stack->sp + (i))
+/// Removes the range of values [start,end[ relative to the top of the stack
+#define script_removetop(st,start,end) ( pop_stack((st), ((st)->stack->sp + (start)), (st)->stack->sp + (end)) )
+
+//
+// struct script_data* data;
+//
+
+/// Returns if the script data is a string
+#define data_isstring(data) ( (data)->type == C_STR || (data)->type == C_CONSTSTR )
+/// Returns if the script data is an int
+#define data_isint(data) ( (data)->type == C_INT )
+/// Returns if the script data is a reference
+#define data_isreference(data) ( (data)->type == C_NAME )
+/// Returns if the script data is a label
+#define data_islabel(data) ( (data)->type == C_POS )
+/// Returns if the script data is an internal script function label
+#define data_isfunclabel(data) ( (data)->type == C_USERFUNC_POS )
+
+/// Returns if this is a reference to a constant
+#define reference_toconstant(data) ( str_data[reference_getid(data)].type == C_INT )
+/// Returns if this a reference to a param
+#define reference_toparam(data) ( str_data[reference_getid(data)].type == C_PARAM )
+/// Returns if this a reference to a variable
+//##TODO confirm it's C_NAME [FlavioJS]
+#define reference_tovariable(data) ( str_data[reference_getid(data)].type == C_NAME )
+/// Returns the unique id of the reference (id and index)
+#define reference_getuid(data) ( (data)->u.num )
+/// Returns the id of the reference
+#define reference_getid(data) ( (int32)(int64)(reference_getuid(data) & 0xffffffff) )
+/// Returns the array index of the reference
+#define reference_getindex(data) ( (uint32)(int64)((reference_getuid(data) >> 32) & 0xffffffff) )
+/// Returns the name of the reference
+#define reference_getname(data) ( str_buf + str_data[reference_getid(data)].str )
+/// Returns the linked list of uid-value pairs of the reference (can be NULL)
+#define reference_getref(data) ( (data)->ref )
+/// Returns the value of the constant
+#define reference_getconstant(data) ( str_data[reference_getid(data)].val )
+/// Returns the type of param
+#define reference_getparamtype(data) ( str_data[reference_getid(data)].val )
+
+/// Composes the uid of a reference from the id and the index  根据id和索引组成引用的uid
+#define reference_uid(id,idx) ( (int64) ((uint64)(id) & 0xFFFFFFFF) | ((uint64)(idx) << 32) )
+
+/// Checks whether two references point to the same variable (or array)
+#define is_same_reference(data1, data2) \
+	(  reference_getid(data1) == reference_getid(data2) \
+	&& ( (data1->ref == data2->ref && data1->ref == NULL) \
+	  || (data1->ref != NULL && data2->ref != NULL && data1->ref->vars == data2->ref->vars \
+	     ) ) )
+
+#define script_getvarid(var) ( (int32)(int64)(var & 0xFFFFFFFF) )
+#define script_getvaridx(var) ( (uint32)(int64)((var >> 32) & 0xFFFFFFFF) )
+
+#define not_server_variable(prefix) ( (prefix) != '$' && (prefix) != '.' && (prefix) != '\'')
+#define is_string_variable(name) ( (name)[strlen(name) - 1] == '$' )
+
+#define FETCH(n, t) \
+		if( script_hasdata(st,n) ) \
+			(t)=script_getnum(st,n);
+
+/// Maximum amount of elements in script arrays
+#define SCRIPT_MAX_ARRAYSIZE (UINT_MAX - 1)
+
+enum script_cmd_result {
+	SCRIPT_CMD_SUCCESS = 0, ///when a buildin cmd was correctly done当正确执行了内置命令时
+	SCRIPT_CMD_FAILURE = 1, ///when an errors appear in cmd, show_debug will follow当cmd中出现错误时，会出现show_debug
+};
+
+#define SCRIPT_BLOCK_SIZE 512
+enum e_labelType { LABEL_NEXTLINE = 1, LABEL_START };
+
+class map_session_data;
+struct eri;
+
+extern int potion_flag; //For use on Alchemist improved potions/Potion Pitcher. [Skotlex]
+extern int potion_hp, potion_per_hp, potion_sp, potion_per_sp;
+extern int potion_target;
+extern unsigned int *generic_ui_array;
+extern unsigned int generic_ui_array_size;
+
+struct Script_Config {
+	unsigned warn_func_mismatch_argtypes : 1;
+	unsigned warn_func_mismatch_paramnum : 1;
+	int check_cmdcount;
+	int check_gotocount;
+	int input_min_value;
+	int input_max_value;
+
+	// PC related
+	const char *die_event_name;
+	const char *kill_pc_event_name;
+	const char *kill_mob_event_name;
+	const char *login_event_name;
+	const char *logout_event_name;
+	const char *loadmap_event_name;
+	const char *baselvup_event_name;
+	const char *joblvup_event_name;
+
+	/************************************************************************/
+	/* Filter 类型的过滤事件，这些事件可以被 processhalt 中断                    */
+	/************************************************************************/
+
+#ifdef Pandas_NpcFilter_IDENTIFY
+	const char* identify_filter_name;	// NPCF_IDENTIFY	// OnPCIdentifyFilter	// 当玩家在装备鉴定列表中选择好装备, 并点击“确定”按钮时触发过滤器
+#endif // Pandas_NpcFilter_IDENTIFY
+
+#ifdef Pandas_NpcFilter_ENTERCHAT
+	const char* enterchat_filter_name;	// NPCF_ENTERCHAT	// OnPCInChatroomFilter	// 当玩家进入 NPC 开启的聊天室时触发过滤器
+#endif // Pandas_NpcFilter_ENTERCHAT
+
+#ifdef Pandas_NpcFilter_INSERT_CARD
+	const char* insert_card_filter_name;	// NPCF_INSERT_CARD	// OnPCInsertCardFilter	// 当玩家准备插入卡片时触发过滤器
+#endif // Pandas_NpcFilter_INSERT_CARD
+
+#ifdef Pandas_NpcFilter_USE_ITEM
+	const char* use_item_filter_name;	// NPCF_USE_ITEM	// OnPCUseItemFilter	// 当玩家准备使用非装备类道具时触发过滤器
+#endif // Pandas_NpcFilter_USE_ITEM
+
+#ifdef Pandas_NpcFilter_USE_SKILL
+	const char* use_skill_filter_name;	// NPCF_USE_SKILL	// OnPCUseSkillFilter	// 当玩家准备使用技能时触发过滤器
+#endif // Pandas_NpcFilter_USE_SKILL
+
+#ifdef Pandas_NpcFilter_ROULETTE_OPEN
+	const char* roulette_open_filter_name;	// NPCF_ROULETTE_OPEN	// OnPCOpenRouletteFilter	// 当玩家准备打开乐透大转盘的时候触发过滤器
+#endif // Pandas_NpcFilter_ROULETTE_OPEN
+
+#ifdef Pandas_NpcFilter_VIEW_EQUIP
+	const char* view_equip_filter_name;	// NPCF_VIEW_EQUIP	// OnPCViewEquipFilter	// 当玩家准备查看某个角色的装备时触发过滤器
+#endif // Pandas_NpcFilter_VIEW_EQUIP
+
+#ifdef Pandas_NpcFilter_EQUIP
+	const char* equip_filter_name;	// NPCF_EQUIP	// OnPCEquipFilter	// 当玩家准备穿戴装备时触发过滤器
+#endif // Pandas_NpcFilter_EQUIP
+
+#ifdef Pandas_NpcFilter_UNEQUIP
+	const char* unequip_filter_name;	// NPCF_UNEQUIP	// OnPCUnequipFilter	// 当玩家准备脱下装备时触发过滤器
+#endif // Pandas_NpcFilter_UNEQUIP
+
+#ifdef Pandas_NpcFilter_CHANGETITLE
+	const char* changetitle_filter_name;	// NPCF_CHANGETITLE	// OnPCChangeTitleFilter	// 当玩家试图变更称号时将触发过滤器
+#endif // Pandas_NpcFilter_CHANGETITLE
+
+#ifdef Pandas_NpcFilter_SC_START
+	const char* sc_start_filter_name;	// NPCF_SC_START	// OnPCBuffStartFilter	// 当玩家准备获得一个状态(Buff)时触发过滤器
+#endif // Pandas_NpcFilter_SC_START
+
+#ifdef Pandas_NpcFilter_USE_REVIVE_TOKEN
+	const char* use_revive_token_filter_name;	// NPCF_USE_REVIVE_TOKEN	// OnPCUseReviveTokenFilter	// 当玩家使用菜单中的原地复活之证时触发过滤器
+#endif // Pandas_NpcFilter_USE_REVIVE_TOKEN
+
+#ifdef Pandas_NpcFilter_ONECLICK_IDENTIFY
+	const char* oneclick_identify_filter_name;	// NPCF_ONECLICK_IDENTIFY	// OnPCUseOCIdentifyFilter	// 当玩家使用一键鉴定道具时触发过滤器
+#endif // Pandas_NpcFilter_ONECLICK_IDENTIFY
+
+#ifdef Pandas_NpcFilter_GUILDCREATE
+	const char* guildcreate_filter_name;	// NPCF_GUILDCREATE	// OnPCGuildCreateFilter	// 当玩家准备创建公会时触发过滤器
+#endif // Pandas_NpcFilter_GUILDCREATE
+
+#ifdef Pandas_NpcFilter_GUILDJOIN
+	const char* guildjoin_filter_name;	// NPCF_GUILDJOIN	// OnPCGuildJoinFilter	// 当玩家即将加入公会时触发过滤器
+#endif // Pandas_NpcFilter_GUILDJOIN
+
+#ifdef Pandas_NpcFilter_GUILDLEAVE
+	const char* guildleave_filter_name;	// NPCF_GUILDLEAVE	// OnPCGuildLeaveFilter	// 当玩家准备离开公会时触发过滤器
+#endif // Pandas_NpcFilter_GUILDLEAVE
+
+#ifdef Pandas_NpcFilter_PARTYCREATE
+	const char* partycreate_filter_name;	// NPCF_PARTYCREATE	// OnPCPartyCreateFilter	// 当玩家准备创建队伍时触发过滤器
+#endif // Pandas_NpcFilter_PARTYCREATE
+
+#ifdef Pandas_NpcFilter_PARTYJOIN
+	const char* partyjoin_filter_name;	// NPCF_PARTYJOIN	// OnPCPartyJoinFilter	// 当玩家即将加入队伍时触发过滤器
+#endif // Pandas_NpcFilter_PARTYJOIN
+
+#ifdef Pandas_NpcFilter_PARTYLEAVE
+	const char* partyleave_filter_name;	// NPCF_PARTYLEAVE	// OnPCPartyLeaveFilter	// 当玩家准备离开队伍时触发过滤器
+#endif // Pandas_NpcFilter_PARTYLEAVE
+
+#ifdef Pandas_NpcFilter_DROPITEM
+	const char* dropitem_filter_name;	// NPCF_DROPITEM	// OnPCDropItemFilter	// 当玩家准备丢弃或掉落道具时触发过滤器
+#endif // Pandas_NpcFilter_DROPITEM
+
+#ifdef Pandas_NpcFilter_CLICKTOMB
+	const char* clicktomb_filter_name;	// NPCF_CLICKTOMB	// OnPCClickTombFilter	// 当玩家点击魔物墓碑时触发过滤器
+#endif // Pandas_NpcFilter_CLICKTOMB
+
+#ifdef Pandas_NpcFilter_STORAGE_ADD
+	const char* storage_add_filter_name;	// NPCF_STORAGE_ADD	// OnPCStorageAddFilter	// 当玩家准备将道具存入仓库时触发过滤器
+#endif // Pandas_NpcFilter_STORAGE_ADD
+
+#ifdef Pandas_NpcFilter_STORAGE_DEL
+	const char* storage_del_filter_name;	// NPCF_STORAGE_DEL	// OnPCStorageDelFilter	// 当玩家准备将道具取出仓库时触发过滤器
+#endif // Pandas_NpcFilter_STORAGE_DEL
+
+#ifdef Pandas_NpcFilter_CART_ADD
+	const char* cart_add_filter_name;	// NPCF_CART_ADD	// OnPCCartAddFilter	// 当玩家准备将道具从背包存入手推车时触发过滤器
+#endif // Pandas_NpcFilter_CART_ADD
+
+#ifdef Pandas_NpcFilter_CART_DEL
+	const char* cart_del_filter_name;	// NPCF_CART_DEL	// OnPCCartDelFilter	// 当玩家准备将道具从手推车取回背包时触发过滤器
+#endif // Pandas_NpcFilter_CART_DEL
+
+#ifdef Pandas_NpcFilter_FAVORITE_ADD
+	const char* favorite_add_filter_name;	// NPCF_FAVORITE_ADD	// OnPCFavoriteAddFilter	// 当玩家准备将道具移入收藏栏位时触发过滤器 [香草]
+#endif // Pandas_NpcFilter_FAVORITE_ADD
+
+#ifdef Pandas_NpcFilter_FAVORITE_DEL
+	const char* favorite_del_filter_name;	// NPCF_FAVORITE_DEL	// OnPCFavoriteDelFilter	// 当玩家准备将道具从收藏栏位移出时触发过滤器 [香草]
+#endif // Pandas_NpcFilter_FAVORITE_DEL
+	// PYHELP - NPCEVENT - INSERT POINT - <Section 4>
+
+	/************************************************************************/
+	/* Event  类型的标准事件，这些事件不能被 processhalt 打断                    */
+	/************************************************************************/
+
+#ifdef Pandas_NpcEvent_KILLMVP
+	const char* killmvp_event_name;	// NPCE_KILLMVP		// OnPCKillMvpEvent		// 当玩家杀死 MVP 魔物后触发事件
+#endif // Pandas_NpcEvent_KILLMVP
+
+#ifdef Pandas_NpcEvent_IDENTIFY
+	const char* identify_event_name;	// NPCE_IDENTIFY	// OnPCIdentifyEvent	// 当玩家成功鉴定了装备时触发事件
+#endif // Pandas_NpcEvent_IDENTIFY
+
+#ifdef Pandas_NpcEvent_INSERT_CARD
+	const char* insert_card_event_name;	// NPCE_INSERT_CARD	// OnPCInsertCardEvent	// 当玩家成功插入卡片后触发事件
+#endif // Pandas_NpcEvent_INSERT_CARD
+
+#ifdef Pandas_NpcEvent_USE_ITEM
+	const char* use_item_event_name;	// NPCE_USE_ITEM	// OnPCUseItemEvent	// 当玩家成功使用非装备类道具后触发事件
+#endif // Pandas_NpcEvent_USE_ITEM
+
+#ifdef Pandas_NpcEvent_USE_SKILL
+	const char* use_skill_event_name;	// NPCE_USE_SKILL	// OnPCUseSkillEvent	// 当玩家成功使用技能后触发事件
+#endif // Pandas_NpcEvent_USE_SKILL
+
+#ifdef Pandas_NpcEvent_EQUIP
+	const char* equip_event_name;	// NPCE_EQUIP	// OnPCEquipEvent	// 当玩家成功穿戴一件装备时触发事件
+#endif // Pandas_NpcEvent_EQUIP
+
+#ifdef Pandas_NpcEvent_UNEQUIP
+	const char* unequip_event_name;	// NPCE_UNEQUIP	// OnPCUnequipEvent	// 当玩家成功脱下一件装备时触发事件
+#endif // Pandas_NpcEvent_UNEQUIP
+	// PYHELP - NPCEVENT - INSERT POINT - <Section 10>
+
+	/************************************************************************/
+	/* Express 类型的快速事件，这些事件将会被立刻执行, 不进事件队列                */
+	/************************************************************************/
+
+#ifdef Pandas_NpcExpress_STATCALC
+	const char* statcalc_express_name;	// NPCE_STATCALC	// OnPCStatCalcEvent	// 当角色能力被重新计算时触发事件
+#endif // Pandas_NpcExpress_STATCALC
+
+#ifdef Pandas_NpcExpress_SC_END
+	const char* sc_end_express_name;	// NPCX_SC_END	// OnPCBuffEndExpress	// 当玩家成功解除一个状态(Buff)后触发实时事件
+#endif // Pandas_NpcExpress_SC_END
+
+#ifdef Pandas_NpcExpress_SC_START
+	const char* sc_start_express_name;	// NPCX_SC_START	// OnPCBuffStartExpress	// 当玩家成功获得一个状态(Buff)后触发实时事件
+#endif // Pandas_NpcExpress_SC_START
+
+#ifdef Pandas_NpcExpress_ENTERMAP
+	const char* entermap_express_name;	// NPCX_ENTERMAP	// OnPCEnterMapExpress	// 当玩家进入或者改变地图时触发实时事件
+#endif // Pandas_NpcExpress_ENTERMAP
+
+#ifdef Pandas_NpcExpress_PROGRESSABORT
+	const char* progressabort_express_name;	// NPCX_PROGRESSABORT	// OnPCProgressAbortExpress	// 当 progressbar 进度条被打断时触发实时事件
+#endif // Pandas_NpcExpress_PROGRESSABORT
+
+#ifdef Pandas_NpcExpress_UNIT_KILL
+	const char* unit_kill_express_name;	// NPCX_UNIT_KILL	// OnUnitKillExpress	// 当某个单位被击杀时触发实时事件
+#endif // Pandas_NpcExpress_UNIT_KILL
+
+#ifdef Pandas_NpcExpress_MOBDROPITEM
+	const char* mobdropitem_express_name;	// NPCX_MOBDROPITEM	// OnMobDropItemExpress	// 当魔物即将掉落道具时触发实时事件
+#endif // Pandas_NpcExpress_MOBDROPITEM
+
+#ifdef Pandas_NpcExpress_PCATTACK
+	const char* pcattack_express_name;	// NPCX_PCATTACK	// OnPCAttackExpress	// 当玩家发起攻击并即将进行结算时触发实时事件 [聽風]
+#endif // Pandas_NpcExpress_PCATTACK
+
+#ifdef Pandas_NpcExpress_MER_CALL
+	const char* mer_call_express_name;	// NPCX_MER_CALL	// OnPCMerCallExpress	// 当玩家成功召唤出佣兵时触发实时事件
+#endif // Pandas_NpcExpress_MER_CALL
+
+#ifdef Pandas_NpcExpress_MER_LEAVE
+	const char* mer_leave_express_name;	// NPCX_MER_LEAVE	// OnPCMerLeaveExpress	// 当佣兵离开玩家时触发实时事件
+#endif // Pandas_NpcExpress_MER_LEAVE
+
+#ifdef Pandas_NpcExpress_PC_TALK
+	const char* pc_talk_express_name;	// NPCX_PC_TALK	// OnPCTalkExpress	// 当玩家往聊天框发送信息时触发实时事件 [人鱼姬的思念]
+#endif // Pandas_NpcExpress_PC_TALK
+
+#ifdef Pandas_NpcExpress_PCHARMED
+	const char* pcharmed_express_name;	// NPCX_PCHARMED	// OnPCHarmedExpress	// 当玩家受到伤害并即将进行结算时触发实时事件 [人鱼姬的思念]
+#endif // Pandas_NpcExpress_PCHARMED
+
+
+
+	//-----761355061---添加事件2---增加事件类型结构---------------
+	const char* pc_sy_pet_menu;	//NPCF_SY_PET_MUNU,		//On_sy_petmenuFilter			//	当玩家点击宠物菜单时触发的实时事件
+	const char* sy_natural_heal;	// NPCX_NATURAL_HEAL	// OnPCNaturalHeal					// 当角色自动恢复时触发的事件
+	const char* sy_use_card;		// NPCX_USE_CARD	// OnPCUseCardFilter					// 当玩家使用卡片时触发的事件
+	const char* sy_moblootitems;		// NPCX_LOOT_ITEMS	// OnMOBlootitemsFilter				// 当魔物即将掠夺道具时触发的事件
+	const char* sy_trade_traderequest;		// NPCX_TRADE_TRADEREQUEST	// OnPCtraderequest				// 当玩家受到交易请求时触发的事件
+	const char* sy_trade_tradeok;		// NPCX_TRADE_TRADEOK	// OnPCtradeok				// 当交易玩家点击确定时触发的事件
+	const char* sy_trade_tradecommit;		// NPCX_TRADE_TRADECOMMIT	// OnPCtradercommit				// 当交易玩家点击交易时触发的事件
+
+
+	//------------------------------------------------------------
+	//
+	//
+	// 
+	// PYHELP - NPCEVENT - INSERT POINT - <Section 16>
+
+	// NPC related
+	const char* ontouch_event_name;
+	const char* ontouch2_event_name;
+	const char* ontouchnpc_event_name;
+	const char* onwhisper_event_name;
+	const char* oncommand_event_name;
+	const char* onbuy_event_name;
+	const char* onsell_event_name;
+
+	// Init related
+	const char* init_event_name;
+	const char* inter_init_event_name;
+	const char* inter_init_once_event_name;
+
+	// Guild related
+	const char* guild_break_event_name;
+	const char* agit_start_event_name;
+	const char* agit_init_event_name;
+	const char* agit_end_event_name;
+	const char* agit_start2_event_name;
+	const char* agit_init2_event_name;
+	const char* agit_end2_event_name;
+	const char* agit_start3_event_name;
+	const char* agit_init3_event_name;
+	const char* agit_end3_event_name;
+
+	// Timer related
+	const char* timer_event_name;
+	const char* timer_quit_event_name;
+	const char* timer_minute_event_name;
+	const char* timer_hour_event_name;
+	const char* timer_clock_event_name;
+	const char* timer_day_event_name;
+	const char* timer_sunday_event_name;
+	const char* timer_monday_event_name;
+	const char* timer_tuesday_event_name;
+	const char* timer_wednesday_event_name;
+	const char* timer_thursday_event_name;
+	const char* timer_friday_event_name;
+	const char* timer_saturday_event_name;
+
+	// Instance related
+	const char* instance_init_event_name;
+	const char* instance_destroy_event_name;
+
+	// Navigation related
+	const char* navi_generate_name;
+};
+extern struct Script_Config script_config;
+
+typedef enum c_op {
+	C_NOP, // end of script/no value (nil)
+	C_POS,
+	C_INT, // number
+	C_PARAM, // parameter variable (see pc_readparam/pc_setparam)
+	C_FUNC, // buildin function call
+	C_STR, // string (free'd automatically)
+	C_CONSTSTR, // string (not free'd)
+	C_ARG, // start of argument list
+	C_NAME,
+	C_EOL, // end of line (extra stack values are cleared)
+	C_RETINFO,
+	C_USERFUNC, // internal script function
+	C_USERFUNC_POS, // internal script function label
+	C_REF, // the next call to c_op2 should push back a ref to the left operand
+
+	// operators
+	C_OP3, // a ? b : c
+	C_LOR, // a || b
+	C_LAND, // a && b
+	C_LE, // a <= b
+	C_LT, // a < b
+	C_GE, // a >= b
+	C_GT, // a > b
+	C_EQ, // a == b
+	C_NE, // a != b
+	C_XOR, // a ^ b
+	C_OR, // a | b
+	C_AND, // a & b
+	C_ADD, // a + b
+	C_SUB, // a - b
+	C_MUL, // a * b
+	C_DIV, // a / b
+	C_MOD, // a % b
+	C_NEG, // - a
+	C_LNOT, // ! a
+	C_NOT, // ~ a
+	C_R_SHIFT, // a >> b
+	C_L_SHIFT, // a << b
+	C_ADD_POST, // a++
+	C_SUB_POST, // a--
+	C_ADD_PRE, // ++a
+	C_SUB_PRE, // --a
+} c_op;
+
+/**
+ * Generic reg database abstraction to be used with various types of regs/script variables.
+ */
+struct reg_db {
+	struct DBMap *vars;
+	struct DBMap *arrays;
+};
+
+struct script_retinfo {
+	struct reg_db scope;        ///< scope variables
+	struct script_code* script; ///< script code
+	int pos;                    ///< script location
+	int nargs;                  ///< argument count
+	int defsp;                  ///< default stack pointer
+};
+
+struct script_data {
+	enum c_op type;
+	union script_data_val {
+		int64 num;
+		char *str;
+		struct script_retinfo* ri;
+	} u;
+	struct reg_db *ref;
+};
+
+// Moved defsp from script_state to script_stack since
+// it must be saved when script state is RERUNLINE. [Eoe / jA 1094]
+struct script_code {
+	int script_size;
+	unsigned char* script_buf;
+	struct reg_db local;
+	unsigned short instances;
+};
+
+struct script_stack {
+	int sp;                         ///< number of entries in the stack
+	int sp_max;                     ///< capacity of the stack
+	int defsp;
+	struct script_data *stack_data; ///< stack
+	struct reg_db scope;            ///< scope variables
+};
+
+
+//
+// Script state
+//
+enum e_script_state { RUN,STOP,END,RERUNLINE,GOTO,RETFUNC,CLOSE };
+
+struct script_state {
+	struct script_stack* stack;
+	int start,end;
+	int pos;
+	enum e_script_state state;
+	int rid,oid;
+	struct script_code *script;
+	struct sleep_data {
+		int tick,timer,charid;
+	} sleep;
+#ifndef Pandas_ScriptEngine_MutliStackBackup
+	//For backing up purposes
+	struct script_state *bk_st;
+	int bk_npcid;
+#endif // Pandas_ScriptEngine_MutliStackBackup
+	unsigned freeloop : 1;// used by buildin_freeloop
+#ifdef Pandas_ScriptCommand_UnlockCmd
+	unsigned unlockcmd : 1;
+#endif // Pandas_ScriptCommand_UnlockCmd
+#ifdef Pandas_ScriptCommand_GetInventoryList
+	unsigned waiting_premium_storage : 1;
+	unsigned waiting_guild_storage : 1;
+#endif // Pandas_ScriptCommand_GetInventoryList
+	unsigned op2ref : 1;// used by op_2
+	unsigned npc_item_flag : 1;
+	unsigned mes_active : 1;  // Store if invoking character has a NPC dialog box open.
+	unsigned clear_cutin : 1;
+	char* funcname; // Stores the current running function name
+	unsigned int id;
+	bool asyncSleep;
+};
+
+#ifdef Pandas_ScriptEngine_MutliStackBackup
+struct mutli_state {
+	struct script_state* bk_st;
+	int bk_npcid;
+};
+#endif // Pandas_ScriptEngine_MutliStackBackup
+
+struct script_reg {
+	int64 index;
+	int data;
+};
+
+struct script_regstr {
+	int64 index;
+	char* data;
+};
+
+struct script_array {
+	unsigned int id;       ///< the first 32b of the 64b uid, aka the id
+	unsigned int size;     ///< how many members
+	unsigned int *members; ///< member list
+};
+
+enum script_parse_options {
+	SCRIPT_USE_LABEL_DB = 0x1,// records labels in scriptlabel_db
+	SCRIPT_IGNORE_EXTERNAL_BRACKETS = 0x2,// ignores the check for {} brackets around the script
+	SCRIPT_RETURN_EMPTY_SCRIPT = 0x4// returns the script object instead of NULL for empty scripts
+};
+
+enum monsterinfo_types {
+	MOB_NAME = 0,
+	MOB_LV,
+	MOB_MAXHP,
+	MOB_BASEEXP,
+	MOB_JOBEXP,
+	MOB_ATK1,
+	MOB_ATK2,
+	MOB_DEF,
+	MOB_MDEF,
+	MOB_RES,
+	MOB_MRES,
+	MOB_STR,
+	MOB_AGI,
+	MOB_VIT,
+	MOB_INT,
+	MOB_DEX,
+	MOB_LUK,
+	MOB_RANGE,
+	MOB_RANGE2,
+	MOB_RANGE3,
+	MOB_SIZE,
+	MOB_RACE,
+	MOB_ELEMENT,
+	MOB_MODE,
+	MOB_MVPEXP,
+	MOB_ID,
+};
+
+enum petinfo_types {
+	PETINFO_ID = 0,
+	PETINFO_CLASS,
+	PETINFO_NAME,
+	PETINFO_INTIMATE,
+	PETINFO_HUNGRY,
+	PETINFO_RENAMED,
+	PETINFO_LEVEL,
+	PETINFO_BLOCKID,
+	PETINFO_EGGID,
+	PETINFO_FOODID
+};
+
+enum e_questinfo_types {
+	QTYPE_QUEST = 0,
+	QTYPE_QUEST2,
+	QTYPE_JOB,
+	QTYPE_JOB2,
+	QTYPE_EVENT,
+	QTYPE_EVENT2,
+	QTYPE_WARG,
+	QTYPE_CLICKME = QTYPE_WARG,
+	QTYPE_DAILYQUEST,
+	QTYPE_WARG2,
+	QTYPE_EVENT3 = QTYPE_WARG2,
+	QTYPE_JOBQUEST,
+	QTYPE_JUMPING_PORING,
+	// 11 - 9998 = free
+	QTYPE_NONE = 9999
+};
+
+enum e_questinfo_markcolor : uint8 {
+	QMARK_NONE = 0,
+	QMARK_YELLOW,
+	QMARK_GREEN,
+	QMARK_PURPLE,
+	QMARK_MAX
+};
+
+#ifndef WIN32
+	// These are declared in wingdi.h
+	/* Font Weights */
+	#define FW_DONTCARE         0
+	#define FW_THIN             100
+	#define FW_EXTRALIGHT       200
+	#define FW_LIGHT            300
+	#define FW_NORMAL           400
+	#define FW_MEDIUM           500
+	#define FW_SEMIBOLD         600
+	#define FW_BOLD             700
+	#define FW_EXTRABOLD        800
+	#define FW_HEAVY            900
+#endif
+
+#ifdef Pandas_ScriptCommand_GetSkillInfo
+enum skillinfo_types {
+	SKI_CASTTYPE = 1,
+	SKI_NAME,
+	SKI_DESCRIPTION,
+	SKI_MAXLEVEL_IN_SKILLTREE,
+	SKI_SKILLTYPE,
+	SKI_HIT,
+	SKI_TARGETTYPE,
+	SKI_ELEMENT,
+	SKI_DAMAGEFLAGS,
+	SKI_MAXLEVEL,
+	SKI_RANGE,
+	SKI_SPLASHAREA,
+	SKI_HITCOUNT,
+	SKI_CASTTIME,
+	SKI_FIXEDCASTTIME,
+	SKI_AFTERCASTACTDELAY,
+	SKI_AFTERCASTWALKDELAY,
+	SKI_DURATION1,
+	SKI_DURATION2,
+	SKI_CASTTIMEFLAGS,
+	SKI_CASTDELAYFLAGS,
+	SKI_CASTDEFENSEREDUCTION,
+	SKI_FLAGS,
+	SKI_CASTCANCEL,
+	SKI_ACTIVEINSTANCE,
+	SKI_KNOCKBACK,
+	SKI_COOLDOWN,
+	SKI_NONEARNPC_TYPE,
+	SKI_NONEARNPC_ADDITIONALRANGE,
+	SKI_COPYFLAGS_SKILL,
+	SKI_COPYFLAGS_REMOVEREQUIREMENT,
+	SKI_UNIT_ID,
+	SKI_UNIT_ALTERNATEID,
+	SKI_UNIT_LAYOUT,
+	SKI_UNIT_RANGE,
+	SKI_UNIT_INTERVAL,
+	SKI_UNIT_TARGET,
+	SKI_UNIT_FLAG,
+	SKI_REQUIRES_HPCOST,
+	SKI_REQUIRES_SPCOST,
+	SKI_REQUIRES_MAXHPTRIGGER,
+	SKI_REQUIRES_HPRATECOST,
+	SKI_REQUIRES_SPRATECOST,
+	SKI_REQUIRES_ZENYCOST,
+	SKI_REQUIRES_WEAPON,
+	SKI_REQUIRES_AMMO,
+	SKI_REQUIRES_AMMOAMOUNT,
+	SKI_REQUIRES_STATE,
+	SKI_REQUIRES_STATUS,
+	SKI_REQUIRES_SPHERECOST,
+	SKI_REQUIRES_ITEMCOST,
+	SKI_REQUIRES_EQUIPMENT,
+};
+#endif // Pandas_ScriptCommand_GetSkillInfo
+
+enum unitdata_mobtypes {
+	UMOB_SIZE = 0,
+	UMOB_LEVEL,
+	UMOB_HP,
+	UMOB_MAXHP,
+	UMOB_MASTERAID,
+	UMOB_MAPID,
+	UMOB_X,
+	UMOB_Y,
+	UMOB_SPEED,
+	UMOB_MODE,
+	UMOB_AI,
+	UMOB_SCOPTION,
+	UMOB_SEX,
+	UMOB_CLASS,
+	UMOB_HAIRSTYLE,
+	UMOB_HAIRCOLOR,
+	UMOB_HEADBOTTOM,
+	UMOB_HEADMIDDLE,
+	UMOB_HEADTOP,
+	UMOB_CLOTHCOLOR,
+	UMOB_SHIELD,
+	UMOB_WEAPON,
+	UMOB_LOOKDIR,
+	UMOB_CANMOVETICK,
+	UMOB_STR,
+	UMOB_AGI,
+	UMOB_VIT,
+	UMOB_INT,
+	UMOB_DEX,
+	UMOB_LUK,
+	UMOB_SLAVECPYMSTRMD,
+	UMOB_DMGIMMUNE,
+	UMOB_ATKRANGE,
+	UMOB_ATKMIN,
+	UMOB_ATKMAX,
+	UMOB_MATKMIN,
+	UMOB_MATKMAX,
+	UMOB_DEF,
+	UMOB_MDEF,
+	UMOB_HIT,
+	UMOB_FLEE,
+	UMOB_PDODGE,
+	UMOB_CRIT,
+	UMOB_RACE,
+	UMOB_ELETYPE,
+	UMOB_ELELEVEL,
+	UMOB_AMOTION,
+	UMOB_ADELAY,
+	UMOB_DMOTION,
+	UMOB_TARGETID,
+	UMOB_ROBE,
+	UMOB_BODY2,
+	UMOB_GROUP_ID,
+	UMOB_IGNORE_CELL_STACK_LIMIT,
+	UMOB_RES,
+	UMOB_MRES,
+	UMOB_DAMAGETAKEN,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UMOB_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+#ifdef Pandas_ScriptParams_DamageTaken_From_Database
+	UMOB_DAMAGETAKEN_DB,
+#endif // Pandas_ScriptParams_DamageTaken_From_Database
+#ifdef Pandas_ScriptParams_UnitData_Experience
+	UMOB_MOBBASEEXP,
+	UMOB_MOBBASEEXP_DB,
+	UMOB_MOBJOBEXP,
+	UMOB_MOBJOBEXP_DB,
+#endif // Pandas_ScriptParams_UnitData_Experience
+
+
+	UMOB_SY_ADDATTACKHARM,				//攻击伤害增加
+	UMOB_SY_ADDSKILLHARM,				//技能伤害增加
+	UMOB_SY_SUBATTACKHARM,				//攻击伤害降低
+	UMOB_SY_SUBSKILLHARM,				//技能伤害降低
+
+	UMOB_SY_HARM_ON,					//自定义减伤机制开关
+	UMOB_SY_HARM_1W_10,					//当受到伤害超过 1W 时,受到伤害变成10分之?
+	UMOB_SY_HARM_10W_100,				//当受到伤害超过 10W 时,受到伤害变成100分之?
+	UMOB_SY_HARM_100W_1K,				//当受到伤害超过 100W 时,受到伤害变成1K分之?
+	UMOB_SY_HARM_1KW_1W,				//当受到伤害超过 1000W 时,受到伤害变成1W分之?
+	UMOB_SY_HARM_1E_10W,				//当受到伤害超过 1E	时,受到伤害变成10W分之?
+	UMOB_SY_HARM_10E_100W,				//当受到伤害超过 10E 时,受到伤害变成100W分之?
+	UMOB_SY_HARM_100E_1KW,				//当受到伤害超过 100E 时,受到伤害变成1KW分之?
+	UMOB_SY_HARM_1KE_1E,				//当受到伤害超过 1KE 时,受到伤害变成1E分之?
+	UMOB_SY_HARM_1WE_10E,				//当受到伤害超过 1WE 时,受到伤害变成10E分之?
+
+};
+
+enum unitdata_homuntypes {
+	UHOM_SIZE = 0,
+	UHOM_LEVEL,
+	UHOM_HP,
+	UHOM_MAXHP,
+	UHOM_SP,
+	UHOM_MAXSP,
+	UHOM_MASTERCID,
+	UHOM_MAPID,
+	UHOM_X,
+	UHOM_Y,
+	UHOM_HUNGER,
+	UHOM_INTIMACY,
+	UHOM_SPEED,
+	UHOM_LOOKDIR,
+	UHOM_CANMOVETICK,
+	UHOM_STR,
+	UHOM_AGI,
+	UHOM_VIT,
+	UHOM_INT,
+	UHOM_DEX,
+	UHOM_LUK,
+	UHOM_DMGIMMUNE,
+	UHOM_ATKRANGE,
+	UHOM_ATKMIN,
+	UHOM_ATKMAX,
+	UHOM_MATKMIN,
+	UHOM_MATKMAX,
+	UHOM_DEF,
+	UHOM_MDEF,
+	UHOM_HIT,
+	UHOM_FLEE,
+	UHOM_PDODGE,
+	UHOM_CRIT,
+	UHOM_RACE,
+	UHOM_ELETYPE,
+	UHOM_ELELEVEL,
+	UHOM_AMOTION,
+	UHOM_ADELAY,
+	UHOM_DMOTION,
+	UHOM_TARGETID,
+	UHOM_GROUP_ID,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UHOM_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+};
+
+enum unitdata_pettypes {
+	UPET_SIZE = 0,
+	UPET_LEVEL,
+	UPET_HP,
+	UPET_MAXHP,
+	UPET_MASTERAID,
+	UPET_MAPID,
+	UPET_X,
+	UPET_Y,
+	UPET_HUNGER,
+	UPET_INTIMACY,
+	UPET_SPEED,
+	UPET_LOOKDIR,
+	UPET_CANMOVETICK,
+	UPET_STR,
+	UPET_AGI,
+	UPET_VIT,
+	UPET_INT,
+	UPET_DEX,
+	UPET_LUK,
+	UPET_DMGIMMUNE,
+	UPET_ATKRANGE,
+	UPET_ATKMIN,
+	UPET_ATKMAX,
+	UPET_MATKMIN,
+	UPET_MATKMAX,
+	UPET_DEF,
+	UPET_MDEF,
+	UPET_HIT,
+	UPET_FLEE,
+	UPET_PDODGE,
+	UPET_CRIT,
+	UPET_RACE,
+	UPET_ELETYPE,
+	UPET_ELELEVEL,
+	UPET_AMOTION,
+	UPET_ADELAY,
+	UPET_DMOTION,
+	UPET_GROUP_ID,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UPET_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+};
+
+enum unitdata_merctypes {
+	UMER_SIZE = 0,
+	UMER_HP,
+	UMER_MAXHP,
+	UMER_MASTERCID,
+	UMER_MAPID,
+	UMER_X,
+	UMER_Y,
+	UMER_KILLCOUNT,
+	UMER_LIFETIME,
+	UMER_SPEED,
+	UMER_LOOKDIR,
+	UMER_CANMOVETICK,
+	UMER_STR,
+	UMER_AGI,
+	UMER_VIT,
+	UMER_INT,
+	UMER_DEX,
+	UMER_LUK,
+	UMER_DMGIMMUNE,
+	UMER_ATKRANGE,
+	UMER_ATKMIN,
+	UMER_ATKMAX,
+	UMER_MATKMIN,
+	UMER_MATKMAX,
+	UMER_DEF,
+	UMER_MDEF,
+	UMER_HIT,
+	UMER_FLEE,
+	UMER_PDODGE,
+	UMER_CRIT,
+	UMER_RACE,
+	UMER_ELETYPE,
+	UMER_ELELEVEL,
+	UMER_AMOTION,
+	UMER_ADELAY,
+	UMER_DMOTION,
+	UMER_TARGETID,
+	UMER_GROUP_ID,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UMER_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+};
+
+enum unitdata_elemtypes {
+	UELE_SIZE = 0,
+	UELE_HP,
+	UELE_MAXHP,
+	UELE_SP,
+	UELE_MAXSP,
+	UELE_MASTERCID,
+	UELE_MAPID,
+	UELE_X,
+	UELE_Y,
+	UELE_LIFETIME,
+	UELE_MODE,
+	UELE_SPEED,
+	UELE_LOOKDIR,
+	UELE_CANMOVETICK,
+	UELE_STR,
+	UELE_AGI,
+	UELE_VIT,
+	UELE_INT,
+	UELE_DEX,
+	UELE_LUK,
+	UELE_DMGIMMUNE,
+	UELE_ATKRANGE,
+	UELE_ATKMIN,
+	UELE_ATKMAX,
+	UELE_MATKMIN,
+	UELE_MATKMAX,
+	UELE_DEF,
+	UELE_MDEF,
+	UELE_HIT,
+	UELE_FLEE,
+	UELE_PDODGE,
+	UELE_CRIT,
+	UELE_RACE,
+	UELE_ELETYPE,
+	UELE_ELELEVEL,
+	UELE_AMOTION,
+	UELE_ADELAY,
+	UELE_DMOTION,
+	UELE_TARGETID,
+	UELE_GROUP_ID,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UELE_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+};
+
+enum unitdata_npctypes {
+	UNPC_LEVEL = 0,
+	UNPC_HP,
+	UNPC_MAXHP,
+	UNPC_MAPID,
+	UNPC_X,
+	UNPC_Y,
+	UNPC_LOOKDIR,
+	UNPC_STR,
+	UNPC_AGI,
+	UNPC_VIT,
+	UNPC_INT,
+	UNPC_DEX,
+	UNPC_LUK,
+	UNPC_PLUSALLSTAT,
+	UNPC_DMGIMMUNE,
+	UNPC_ATKRANGE,
+	UNPC_ATKMIN,
+	UNPC_ATKMAX,
+	UNPC_MATKMIN,
+	UNPC_MATKMAX,
+	UNPC_DEF,
+	UNPC_MDEF,
+	UNPC_HIT,
+	UNPC_FLEE,
+	UNPC_PDODGE,
+	UNPC_CRIT,
+	UNPC_RACE,
+	UNPC_ELETYPE,
+	UNPC_ELELEVEL,
+	UNPC_AMOTION,
+	UNPC_ADELAY,
+	UNPC_DMOTION,
+	UNPC_SEX,
+	UNPC_CLASS,
+	UNPC_HAIRSTYLE,
+	UNPC_HAIRCOLOR,
+	UNPC_HEADBOTTOM,
+	UNPC_HEADMIDDLE,
+	UNPC_HEADTOP,
+	UNPC_CLOTHCOLOR,
+	UNPC_SHIELD,
+	UNPC_WEAPON,
+	UNPC_ROBE,
+	UNPC_BODY2,
+	UNPC_DEADSIT,
+	UNPC_GROUP_ID,
+#ifdef Pandas_Struct_Unit_CommonData_Aura
+	UNPC_AURA,
+#endif // Pandas_Struct_Unit_CommonData_Aura
+};
+
+enum navigation_service {
+	NAV_NONE = 0, ///< 0
+	NAV_AIRSHIP_ONLY = 1, ///< 1 (actually 1-9)
+	NAV_SCROLL_ONLY = 10, ///< 10
+	NAV_AIRSHIP_AND_SCROLL = NAV_AIRSHIP_ONLY + NAV_SCROLL_ONLY, ///< 11 (actually 11-99)
+	NAV_KAFRA_ONLY = 100, ///< 100
+	NAV_KAFRA_AND_AIRSHIP = NAV_KAFRA_ONLY + NAV_AIRSHIP_ONLY, ///< 101 (actually 101-109)
+	NAV_KAFRA_AND_SCROLL = NAV_KAFRA_ONLY + NAV_SCROLL_ONLY, ///< 110
+	NAV_ALL = NAV_AIRSHIP_ONLY + NAV_SCROLL_ONLY + NAV_KAFRA_ONLY ///< 111 (actually 111-255)
+};
+
+enum random_option_attribute {
+	ROA_ID = 0,
+	ROA_VALUE,
+	ROA_PARAM,
+};
+
+enum instance_info_type {
+	IIT_ID,
+	IIT_TIME_LIMIT,
+	IIT_IDLE_TIMEOUT,
+	IIT_ENTER_MAP,
+	IIT_ENTER_X,
+	IIT_ENTER_Y,
+	IIT_MAPCOUNT,
+	IIT_MAP
+};
+
+enum e_instance_live_info_type : uint8 {
+	ILI_NAME,
+	ILI_MODE,
+	ILI_OWNER
+};
+
+enum vip_status_type {
+	VIP_STATUS_ACTIVE = 1,
+	VIP_STATUS_EXPIRE,
+	VIP_STATUS_REMAINING
+};
+
+enum e_special_effects {
+	EF_NONE = -1,
+	EF_HIT1,
+	EF_HIT2,
+	EF_HIT3,
+	EF_HIT4,
+	EF_HIT5,
+	EF_HIT6,
+	EF_ENTRY,
+	EF_EXIT,
+	EF_WARP,
+	EF_ENHANCE,
+	EF_COIN,
+	EF_ENDURE,
+	EF_BEGINSPELL,
+	EF_GLASSWALL,
+	EF_HEALSP,
+	EF_SOULSTRIKE,
+	EF_BASH,
+	EF_MAGNUMBREAK,
+	EF_STEAL,
+	EF_HIDING,
+	EF_PATTACK,
+	EF_DETOXICATION,
+	EF_SIGHT,
+	EF_STONECURSE,
+	EF_FIREBALL,
+	EF_FIREWALL,
+	EF_ICEARROW,
+	EF_FROSTDIVER,
+	EF_FROSTDIVER2,
+	EF_LIGHTBOLT,
+	EF_THUNDERSTORM,
+	EF_FIREARROW,
+	EF_NAPALMBEAT,
+	EF_RUWACH,
+	EF_TELEPORTATION,
+	EF_READYPORTAL,
+	EF_PORTAL,
+	EF_INCAGILITY,
+	EF_DECAGILITY,
+	EF_AQUA,
+	EF_SIGNUM,
+	EF_ANGELUS,
+	EF_BLESSING,
+	EF_INCAGIDEX,
+	EF_SMOKE,
+	EF_FIREFLY,
+	EF_SANDWIND,
+	EF_TORCH,
+	EF_SPRAYPOND,
+	EF_FIREHIT,
+	EF_FIRESPLASHHIT,
+	EF_COLDHIT,
+	EF_WINDHIT,
+	EF_POISONHIT,
+	EF_BEGINSPELL2,
+	EF_BEGINSPELL3,
+	EF_BEGINSPELL4,
+	EF_BEGINSPELL5,
+	EF_BEGINSPELL6,
+	EF_BEGINSPELL7,
+	EF_LOCKON,
+	EF_WARPZONE,
+	EF_SIGHTRASHER,
+	EF_BARRIER,
+	EF_ARROWSHOT,
+	EF_INVENOM,
+	EF_CURE,
+	EF_PROVOKE,
+	EF_MVP,
+	EF_SKIDTRAP,
+	EF_BRANDISHSPEAR,
+	EF_CONE,
+	EF_SPHERE,
+	EF_BOWLINGBASH,
+	EF_ICEWALL,
+	EF_GLORIA,
+	EF_MAGNIFICAT,
+	EF_RESURRECTION,
+	EF_RECOVERY,
+	EF_EARTHSPIKE,
+	EF_SPEARBMR,
+	EF_PIERCE,
+	EF_TURNUNDEAD,
+	EF_SANCTUARY,
+	EF_IMPOSITIO,
+	EF_LEXAETERNA,
+	EF_ASPERSIO,
+	EF_LEXDIVINA,
+	EF_SUFFRAGIUM,
+	EF_STORMGUST,
+	EF_LORD,
+	EF_BENEDICTIO,
+	EF_METEORSTORM,
+	EF_YUFITEL,
+	EF_YUFITELHIT,
+	EF_QUAGMIRE,
+	EF_FIREPILLAR,
+	EF_FIREPILLARBOMB,
+	EF_HASTEUP,
+	EF_FLASHER,
+	EF_REMOVETRAP,
+	EF_REPAIRWEAPON,
+	EF_CRASHEARTH,
+	EF_PERFECTION,
+	EF_MAXPOWER,
+	EF_BLASTMINE,
+	EF_BLASTMINEBOMB,
+	EF_CLAYMORE,
+	EF_FREEZING,
+	EF_BUBBLE,
+	EF_GASPUSH,
+	EF_SPRINGTRAP,
+	EF_KYRIE,
+	EF_MAGNUS,
+	EF_BOTTOM,
+	EF_BLITZBEAT,
+	EF_WATERBALL,
+	EF_WATERBALL2,
+	EF_FIREIVY,
+	EF_DETECTING,
+	EF_CLOAKING,
+	EF_SONICBLOW,
+	EF_SONICBLOWHIT,
+	EF_GRIMTOOTH,
+	EF_VENOMDUST,
+	EF_ENCHANTPOISON,
+	EF_POISONREACT,
+	EF_POISONREACT2,
+	EF_OVERTHRUST,
+	EF_SPLASHER,
+	EF_TWOHANDQUICKEN,
+	EF_AUTOCOUNTER,
+	EF_GRIMTOOTHATK,
+	EF_FREEZE,
+	EF_FREEZED,
+	EF_ICECRASH,
+	EF_SLOWPOISON,
+	EF_BOTTOM2,
+	EF_FIREPILLARON,
+	EF_SANDMAN,
+	EF_REVIVE,
+	EF_PNEUMA,
+	EF_HEAVENSDRIVE,
+	EF_SONICBLOW2,
+	EF_BRANDISH2,
+	EF_SHOCKWAVE,
+	EF_SHOCKWAVEHIT,
+	EF_EARTHHIT,
+	EF_PIERCESELF,
+	EF_BOWLINGSELF,
+	EF_SPEARSTABSELF,
+	EF_SPEARBMRSELF,
+	EF_HOLYHIT,
+	EF_CONCENTRATION,
+	EF_REFINEOK,
+	EF_REFINEFAIL,
+	EF_JOBCHANGE,
+	EF_LVUP,
+	EF_JOBLVUP,
+	EF_TOPRANK,
+	EF_PARTY,
+	EF_RAIN,
+	EF_SNOW,
+	EF_SAKURA,
+	EF_STATUS_STATE,
+	EF_BANJJAKII,
+	EF_MAKEBLUR,
+	EF_TAMINGSUCCESS,
+	EF_TAMINGFAILED,
+	EF_ENERGYCOAT,
+	EF_CARTREVOLUTION,
+	EF_VENOMDUST2,
+	EF_CHANGEDARK,
+	EF_CHANGEFIRE,
+	EF_CHANGECOLD,
+	EF_CHANGEWIND,
+	EF_CHANGEFLAME,
+	EF_CHANGEEARTH,
+	EF_CHAINGEHOLY,
+	EF_CHANGEPOISON,
+	EF_HITDARK,
+	EF_MENTALBREAK,
+	EF_MAGICALATTHIT,
+	EF_SUI_EXPLOSION,
+	EF_DARKATTACK,
+	EF_SUICIDE,
+	EF_COMBOATTACK1,
+	EF_COMBOATTACK2,
+	EF_COMBOATTACK3,
+	EF_COMBOATTACK4,
+	EF_COMBOATTACK5,
+	EF_GUIDEDATTACK,
+	EF_POISONATTACK,
+	EF_SILENCEATTACK,
+	EF_STUNATTACK,
+	EF_PETRIFYATTACK,
+	EF_CURSEATTACK,
+	EF_SLEEPATTACK,
+	EF_TELEKHIT,
+	EF_PONG,
+	EF_LEVEL99,
+	EF_LEVEL99_2,
+	EF_LEVEL99_3,
+	EF_GUMGANG,
+	EF_POTION1,
+	EF_POTION2,
+	EF_POTION3,
+	EF_POTION4,
+	EF_POTION5,
+	EF_POTION6,
+	EF_POTION7,
+	EF_POTION8,
+	EF_DARKBREATH,
+	EF_DEFFENDER,
+	EF_KEEPING,
+	EF_SUMMONSLAVE,
+	EF_BLOODDRAIN,
+	EF_ENERGYDRAIN,
+	EF_POTION_CON,
+	EF_POTION_,
+	EF_POTION_BERSERK,
+	EF_POTIONPILLAR,
+	EF_DEFENDER,
+	EF_GANBANTEIN,
+	EF_WIND,
+	EF_VOLCANO,
+	EF_GRANDCROSS,
+	EF_INTIMIDATE,
+	EF_CHOOKGI,
+	EF_CLOUD,
+	EF_CLOUD2,
+	EF_MAPPILLAR,
+	EF_LINELINK,
+	EF_CLOUD3,
+	EF_SPELLBREAKER,
+	EF_DISPELL,
+	EF_DELUGE,
+	EF_VIOLENTGALE,
+	EF_LANDPROTECTOR,
+	EF_BOTTOM_VO,
+	EF_BOTTOM_DE,
+	EF_BOTTOM_VI,
+	EF_BOTTOM_LA,
+	EF_FASTMOVE,
+	EF_MAGICROD,
+	EF_HOLYCROSS,
+	EF_SHIELDCHARGE,
+	EF_MAPPILLAR2,
+	EF_PROVIDENCE,
+	EF_SHIELDBOOMERANG,
+	EF_SPEARQUICKEN,
+	EF_DEVOTION,
+	EF_REFLECTSHIELD,
+	EF_ABSORBSPIRITS,
+	EF_STEELBODY,
+	EF_FLAMELAUNCHER,
+	EF_FROSTWEAPON,
+	EF_LIGHTNINGLOADER,
+	EF_SEISMICWEAPON,
+	EF_MAPPILLAR3,
+	EF_MAPPILLAR4,
+	EF_GUMGANG2,
+	EF_TEIHIT1,
+	EF_GUMGANG3,
+	EF_TEIHIT2,
+	EF_TANJI,
+	EF_TEIHIT1X,
+	EF_CHIMTO,
+	EF_STEALCOIN,
+	EF_STRIPWEAPON,
+	EF_STRIPSHIELD,
+	EF_STRIPARMOR,
+	EF_STRIPHELM,
+	EF_CHAINCOMBO,
+	EF_RG_COIN,
+	EF_BACKSTAP,
+	EF_TEIHIT3,
+	EF_BOTTOM_DISSONANCE,
+	EF_BOTTOM_LULLABY,
+	EF_BOTTOM_RICHMANKIM,
+	EF_BOTTOM_ETERNALCHAOS,
+	EF_BOTTOM_DRUMBATTLEFIELD,
+	EF_BOTTOM_RINGNIBELUNGEN,
+	EF_BOTTOM_ROKISWEIL,
+	EF_BOTTOM_INTOABYSS,
+	EF_BOTTOM_SIEGFRIED,
+	EF_BOTTOM_WHISTLE,
+	EF_BOTTOM_ASSASSINCROSS,
+	EF_BOTTOM_POEMBRAGI,
+	EF_BOTTOM_APPLEIDUN,
+	EF_BOTTOM_UGLYDANCE,
+	EF_BOTTOM_HUMMING,
+	EF_BOTTOM_DONTFORGETME,
+	EF_BOTTOM_FORTUNEKISS,
+	EF_BOTTOM_SERVICEFORYOU,
+	EF_TALK_FROSTJOKE,
+	EF_TALK_SCREAM,
+	EF_POKJUK,
+	EF_THROWITEM,
+	EF_THROWITEM2,
+	EF_CHEMICALPROTECTION,
+	EF_POKJUK_SOUND,
+	EF_DEMONSTRATION,
+	EF_CHEMICAL2,
+	EF_TELEPORTATION2,
+	EF_PHARMACY_OK,
+	EF_PHARMACY_FAIL,
+	EF_FORESTLIGHT,
+	EF_THROWITEM3,
+	EF_FIRSTAID,
+	EF_SPRINKLESAND,
+	EF_LOUD,
+	EF_HEAL,
+	EF_HEAL2,
+	EF_EXIT2,
+	EF_GLASSWALL2,
+	EF_READYPORTAL2,
+	EF_PORTAL2,
+	EF_BOTTOM_MAG,
+	EF_BOTTOM_SANC,
+	EF_HEAL3,
+	EF_WARPZONE2,
+	EF_FORESTLIGHT2,
+	EF_FORESTLIGHT3,
+	EF_FORESTLIGHT4,
+	EF_HEAL4,
+	EF_FOOT,
+	EF_FOOT2,
+	EF_BEGINASURA,
+	EF_TRIPLEATTACK,
+	EF_HITLINE,
+	EF_HPTIME,
+	EF_SPTIME,
+	EF_MAPLE,
+	EF_BLIND,
+	EF_POISON,
+	EF_GUARD,
+	EF_JOBLVUP50,
+	EF_ANGEL2,
+	EF_MAGNUM2,
+	EF_CALLZONE,
+	EF_PORTAL3,
+	EF_COUPLECASTING,
+	EF_HEARTCASTING,
+	EF_ENTRY2,
+	EF_SAINTWING,
+	EF_SPHEREWIND,
+	EF_COLORPAPER,
+	EF_LIGHTSPHERE,
+	EF_WATERFALL,
+	EF_WATERFALL_90,
+	EF_WATERFALL_SMALL,
+	EF_WATERFALL_SMALL_90,
+	EF_WATERFALL_T2,
+	EF_WATERFALL_T2_90,
+	EF_WATERFALL_SMALL_T2,
+	EF_WATERFALL_SMALL_T2_90,
+	EF_MINI_TETRIS,
+	EF_GHOST,
+	EF_BAT,
+	EF_BAT2,
+	EF_SOULBREAKER,
+	EF_LEVEL99_4,
+	EF_VALLENTINE,
+	EF_VALLENTINE2,
+	EF_PRESSURE,
+	EF_BASH3D,
+	EF_AURABLADE,
+	EF_REDBODY,
+	EF_LKCONCENTRATION,
+	EF_BOTTOM_GOSPEL,
+	EF_ANGEL,
+	EF_DEVIL,
+	EF_DRAGONSMOKE,
+	EF_BOTTOM_BASILICA,
+	EF_ASSUMPTIO,
+	EF_HITLINE2,
+	EF_BASH3D2,
+	EF_ENERGYDRAIN2,
+	EF_TRANSBLUEBODY,
+	EF_MAGICCRASHER,
+	EF_LIGHTSPHERE2,
+	EF_LIGHTBLADE,
+	EF_ENERGYDRAIN3,
+	EF_LINELINK2,
+	EF_LINKLIGHT,
+	EF_TRUESIGHT,
+	EF_FALCONASSAULT,
+	EF_TRIPLEATTACK2,
+	EF_PORTAL4,
+	EF_MELTDOWN,
+	EF_CARTBOOST,
+	EF_REJECTSWORD,
+	EF_TRIPLEATTACK3,
+	EF_SPHEREWIND2,
+	EF_LINELINK3,
+	EF_PINKBODY,
+	EF_LEVEL99_5,
+	EF_LEVEL99_6,
+	EF_BASH3D3,
+	EF_BASH3D4,
+	EF_NAPALMVALCAN,
+	EF_PORTAL5,
+	EF_MAGICCRASHER2,
+	EF_BOTTOM_SPIDER,
+	EF_BOTTOM_FOGWALL,
+	EF_SOULBURN,
+	EF_SOULCHANGE,
+	EF_BABY,
+	EF_SOULBREAKER2,
+	EF_RAINBOW,
+	EF_PEONG,
+	EF_TANJI2,
+	EF_PRESSEDBODY,
+	EF_SPINEDBODY,
+	EF_KICKEDBODY,
+	EF_AIRTEXTURE,
+	EF_HITBODY,
+	EF_DOUBLEGUMGANG,
+	EF_REFLECTBODY,
+	EF_BABYBODY,
+	EF_BABYBODY2,
+	EF_GIANTBODY,
+	EF_GIANTBODY2,
+	EF_ASURABODY,
+	EF_4WAYBODY,
+	EF_QUAKEBODY,
+	EF_ASURABODY_MONSTER,
+	EF_HITLINE3,
+	EF_HITLINE4,
+	EF_HITLINE5,
+	EF_HITLINE6,
+	EF_ELECTRIC,
+	EF_ELECTRIC2,
+	EF_HITLINE7,
+	EF_STORMKICK,
+	EF_HALFSPHERE,
+	EF_ATTACKENERGY,
+	EF_ATTACKENERGY2,
+	EF_CHEMICAL3,
+	EF_ASSUMPTIO2,
+	EF_BLUECASTING,
+	EF_RUN,
+	EF_STOPRUN,
+	EF_STOPEFFECT,
+	EF_JUMPBODY,
+	EF_LANDBODY,
+	EF_FOOT3,
+	EF_FOOT4,
+	EF_TAE_READY,
+	EF_GRANDCROSS2,
+	EF_SOULSTRIKE2,
+	EF_YUFITEL2,
+	EF_NPC_STOP,
+	EF_DARKCASTING,
+	EF_GUMGANGNPC,
+	EF_AGIUP,
+	EF_JUMPKICK,
+	EF_QUAKEBODY2,
+	EF_STORMKICK1,
+	EF_STORMKICK2,
+	EF_STORMKICK3,
+	EF_STORMKICK4,
+	EF_STORMKICK5,
+	EF_STORMKICK6,
+	EF_STORMKICK7,
+	EF_SPINEDBODY2,
+	EF_BEGINASURA1,
+	EF_BEGINASURA2,
+	EF_BEGINASURA3,
+	EF_BEGINASURA4,
+	EF_BEGINASURA5,
+	EF_BEGINASURA6,
+	EF_BEGINASURA7,
+	EF_AURABLADE2,
+	EF_DEVIL1,
+	EF_DEVIL2,
+	EF_DEVIL3,
+	EF_DEVIL4,
+	EF_DEVIL5,
+	EF_DEVIL6,
+	EF_DEVIL7,
+	EF_DEVIL8,
+	EF_DEVIL9,
+	EF_DEVIL10,
+	EF_DOUBLEGUMGANG2,
+	EF_DOUBLEGUMGANG3,
+	EF_BLACKDEVIL,
+	EF_FLOWERCAST,
+	EF_FLOWERCAST2,
+	EF_FLOWERCAST3,
+	EF_MOCHI,
+	EF_LAMADAN,
+	EF_EDP,
+	EF_SHIELDBOOMERANG2,
+	EF_RG_COIN2,
+	EF_GUARD2,
+	EF_SLIM,
+	EF_SLIM2,
+	EF_SLIM3,
+	EF_CHEMICALBODY,
+	EF_CASTSPIN,
+	EF_PIERCEBODY,
+	EF_SOULLINK,
+	EF_CHOOKGI2,
+	EF_MEMORIZE,
+	EF_SOULLIGHT,
+	EF_MAPAE,
+	EF_ITEMPOKJUK,
+	EF_05VAL,
+	EF_BEGINASURA11,
+	EF_NIGHT,
+	EF_CHEMICAL2DASH,
+	EF_GROUNDSAMPLE,
+	EF_GI_EXPLOSION,
+	EF_CLOUD4,
+	EF_CLOUD5,
+	EF_BOTTOM_HERMODE,
+	EF_CARTTER,
+	EF_ITEMFAST,
+	EF_SHIELDBOOMERANG3,
+	EF_DOUBLECASTBODY,
+	EF_GRAVITATION,
+	EF_TAROTCARD1,
+	EF_TAROTCARD2,
+	EF_TAROTCARD3,
+	EF_TAROTCARD4,
+	EF_TAROTCARD5,
+	EF_TAROTCARD6,
+	EF_TAROTCARD7,
+	EF_TAROTCARD8,
+	EF_TAROTCARD9,
+	EF_TAROTCARD10,
+	EF_TAROTCARD11,
+	EF_TAROTCARD12,
+	EF_TAROTCARD13,
+	EF_TAROTCARD14,
+	EF_ACIDDEMON,
+	EF_GREENBODY,
+	EF_THROWITEM4,
+	EF_BABYBODY_BACK,
+	EF_THROWITEM5,
+	EF_BLUEBODY,
+	EF_HATED,
+	EF_REDLIGHTBODY,
+	EF_RO2YEAR,
+	EF_SMA_READY,
+	EF_STIN,
+	EF_RED_HIT,
+	EF_BLUE_HIT,
+	EF_QUAKEBODY3,
+	EF_SMA,
+	EF_SMA2,
+	EF_STIN2,
+	EF_HITTEXTURE,
+	EF_STIN3,
+	EF_SMA3,
+	EF_BLUEFALL,
+	EF_BLUEFALL_90,
+	EF_FASTBLUEFALL,
+	EF_FASTBLUEFALL_90,
+	EF_BIG_PORTAL,
+	EF_BIG_PORTAL2,
+	EF_SCREEN_QUAKE,
+	EF_HOMUNCASTING,
+	EF_HFLIMOON1,
+	EF_HFLIMOON2,
+	EF_HFLIMOON3,
+	EF_HO_UP,
+	EF_HAMIDEFENCE,
+	EF_HAMICASTLE,
+	EF_HAMIBLOOD,
+	EF_HATED2,
+	EF_TWILIGHT1,
+	EF_TWILIGHT2,
+	EF_TWILIGHT3,
+	EF_ITEM_THUNDER,
+	EF_ITEM_CLOUD,
+	EF_ITEM_CURSE,
+	EF_ITEM_ZZZ,
+	EF_ITEM_RAIN,
+	EF_ITEM_LIGHT,
+	EF_ANGEL3,
+	EF_M01,
+	EF_M02,
+	EF_M03,
+	EF_M04,
+	EF_M05,
+	EF_M06,
+	EF_M07,
+	EF_KAIZEL,
+	EF_KAAHI,
+	EF_CLOUD6,
+	EF_FOOD01,
+	EF_FOOD02,
+	EF_FOOD03,
+	EF_FOOD04,
+	EF_FOOD05,
+	EF_FOOD06,
+	EF_SHRINK,
+	EF_THROWITEM6,
+	EF_SIGHT2,
+	EF_QUAKEBODY4,
+	EF_FIREHIT2,
+	EF_NPC_STOP2,
+	EF_NPC_STOP2_DEL,
+	EF_FVOICE,
+	EF_WINK,
+	EF_COOKING_OK,
+	EF_COOKING_FAIL,
+	EF_TEMP_OK,
+	EF_TEMP_FAIL,
+	EF_HAPGYEOK,
+	EF_THROWITEM7,
+	EF_THROWITEM8,
+	EF_THROWITEM9,
+	EF_THROWITEM10,
+	EF_BUNSINJYUTSU,
+	EF_KOUENKA,
+	EF_HYOUSENSOU,
+	EF_BOTTOM_SUITON,
+	EF_STIN4,
+	EF_THUNDERSTORM2,
+	EF_CHEMICAL4,
+	EF_STIN5,
+	EF_MADNESS_BLUE,
+	EF_MADNESS_RED,
+	EF_RG_COIN3,
+	EF_BASH3D5,
+	EF_CHOOKGI3,
+	EF_KIRIKAGE,
+	EF_TATAMI,
+	EF_KASUMIKIRI,
+	EF_ISSEN,
+	EF_KAEN,
+	EF_BAKU,
+	EF_HYOUSYOURAKU,
+	EF_DESPERADO,
+	EF_LIGHTNING_S,
+	EF_BLIND_S,
+	EF_POISON_S,
+	EF_FREEZING_S,
+	EF_FLARE_S,
+	EF_RAPIDSHOWER,
+	EF_MAGICALBULLET,
+	EF_SPREADATTACK,
+	EF_TRACKCASTING,
+	EF_TRACKING,
+	EF_TRIPLEACTION,
+	EF_BULLSEYE,
+	EF_MAP_MAGICZONE,
+	EF_MAP_MAGICZONE2,
+	EF_DAMAGE1,
+	EF_DAMAGE1_2,
+	EF_DAMAGE1_3,
+	EF_UNDEADBODY,
+	EF_UNDEADBODY_DEL,
+	EF_GREEN_NUMBER,
+	EF_BLUE_NUMBER,
+	EF_RED_NUMBER,
+	EF_PURPLE_NUMBER,
+	EF_BLACK_NUMBER,
+	EF_WHITE_NUMBER,
+	EF_YELLOW_NUMBER,
+	EF_PINK_NUMBER,
+	EF_BUBBLE_DROP,
+	EF_NPC_EARTHQUAKE,
+	EF_DA_SPACE,
+	EF_DRAGONFEAR,
+	EF_BLEEDING,
+	EF_WIDECONFUSE,
+	EF_BOTTOM_RUNNER,
+	EF_BOTTOM_TRANSFER,
+	EF_CRYSTAL_BLUE,
+	EF_BOTTOM_EVILLAND,
+	EF_GUARD3,
+	EF_NPC_SLOWCAST,
+	EF_CRITICALWOUND,
+	EF_GREEN99_3,
+	EF_GREEN99_5,
+	EF_GREEN99_6,
+	EF_MAPSPHERE,
+	EF_POK_LOVE,
+	EF_POK_WHITE,
+	EF_POK_VALEN,
+	EF_POK_BIRTH,
+	EF_POK_CHRISTMAS,
+	EF_MAP_MAGICZONE3,
+	EF_MAP_MAGICZONE4,
+	EF_DUST,
+	EF_TORCH_RED,
+	EF_TORCH_GREEN,
+	EF_MAP_GHOST,
+	EF_GLOW1,
+	EF_GLOW2,
+	EF_GLOW4,
+	EF_TORCH_PURPLE,
+	EF_CLOUD7,
+	EF_CLOUD8,
+	EF_FLOWERLEAF,
+	EF_MAPSPHERE2,
+	EF_GLOW11,
+	EF_GLOW12,
+	EF_CIRCLELIGHT,
+	EF_ITEM315,
+	EF_ITEM316,
+	EF_ITEM317,
+	EF_ITEM318,
+	EF_STORM_MIN,
+	EF_POK_JAP,
+	EF_MAP_GREENLIGHT,
+	EF_MAP_MAGICWALL,
+	EF_MAP_GREENLIGHT2,
+	EF_YELLOWFLY1,
+	EF_YELLOWFLY2,
+	EF_BOTTOM_BLUE,
+	EF_BOTTOM_BLUE2,
+	EF_WEWISH,
+	EF_FIREPILLARON2,
+	EF_FORESTLIGHT5,
+	EF_SOULBREAKER3,
+	EF_ADO_STR,
+	EF_IGN_STR,
+	EF_CHIMTO2,
+	EF_WINDCUTTER,
+	EF_DETECT2,
+	EF_FROSTMYSTY,
+	EF_CRIMSON_STR,
+	EF_HELL_STR,
+	EF_SPR_MASH,
+	EF_SPR_SOULE,
+	EF_DHOWL_STR,
+	EF_EARTHWALL,
+	EF_SOULBREAKER4,
+	EF_CHAINL_STR,
+	EF_CHOOKGI_FIRE,
+	EF_CHOOKGI_WIND,
+	EF_CHOOKGI_WATER,
+	EF_CHOOKGI_GROUND,
+	EF_MAGENTA_TRAP,
+	EF_COBALT_TRAP,
+	EF_MAIZE_TRAP,
+	EF_VERDURE_TRAP,
+	EF_NORMAL_TRAP,
+	EF_CLOAKING2,
+	EF_AIMED_STR,
+	EF_ARROWSTORM_STR,
+	EF_LAULAMUS_STR,
+	EF_LAUAGNUS_STR,
+	EF_MILSHIELD_STR,
+	EF_CONCENTRATION2,
+	EF_FIREBALL2,
+	EF_BUNSINJYUTSU2,
+	EF_CLEARTIME,
+	EF_GLASSWALL3,
+	EF_ORATIO,
+	EF_POTION_BERSERK2,
+	EF_CIRCLEPOWER,
+	EF_ROLLING1,
+	EF_ROLLING2,
+	EF_ROLLING3,
+	EF_ROLLING4,
+	EF_ROLLING5,
+	EF_ROLLING6,
+	EF_ROLLING7,
+	EF_ROLLING8,
+	EF_ROLLING9,
+	EF_ROLLING10,
+	EF_PURPLEBODY,
+	EF_STIN6,
+	EF_RG_COIN4,
+	EF_POISONWAV,
+	EF_POISONSMOKE,
+	EF_GUMGANG4,
+	EF_SHIELDBOOMERANG4,
+	EF_CASTSPIN2,
+	EF_VULCANWAV,
+	EF_AGIUP2,
+	EF_DETECT3,
+	EF_AGIUP3,
+	EF_DETECT4,
+	EF_ELECTRIC3,
+	EF_GUARD4,
+	EF_BOTTOM_BARRIER,
+	EF_BOTTOM_STEALTH,
+	EF_REPAIRTIME,
+	EF_NC_ANAL,
+	EF_FIRETHROW,
+	EF_VENOMIMPRESS,
+	EF_FROSTMISTY,
+	EF_BURNING,
+	EF_COLDTHROW,
+	EF_MAKEHALLU,
+	EF_HALLUTIME,
+	EF_INFRAREDSCAN,
+	EF_CRASHAXE,
+	EF_GTHUNDER,
+	EF_STONERING,
+	EF_INTIMIDATE2,
+	EF_STASIS,
+	EF_REDLINE,
+	EF_FROSTDIVER3,
+	EF_BOTTOM_BASILICA2,
+	EF_RECOGNIZED,
+	EF_TETRA,
+	EF_TETRACASTING,
+	EF_FIREBALL3,
+	EF_INTIMIDATE3,
+	EF_RECOGNIZED2,
+	EF_CLOAKING3,
+	EF_INTIMIDATE4,
+	EF_STRETCH,
+	EF_BLACKBODY,
+	EF_ENERVATION,
+	EF_ENERVATION2,
+	EF_ENERVATION3,
+	EF_ENERVATION4,
+	EF_ENERVATION5,
+	EF_ENERVATION6,
+	EF_LINELINK4,
+	EF_RG_COIN5,
+	EF_WATERFALL_ANI,
+	EF_BOTTOM_MANHOLE,
+	EF_MANHOLE,
+	EF_MAKEFEINT,
+	EF_FORESTLIGHT6,
+	EF_DARKCASTING2,
+	EF_BOTTOM_ANI,
+	EF_BOTTOM_MAELSTROM,
+	EF_BOTTOM_BLOODYLUST,
+	EF_BEGINSPELL_N1,
+	EF_BEGINSPELL_N2,
+	EF_HEAL_N,
+	EF_CHOOKGI_N,
+	EF_JOBLVUP50_2,
+	EF_CHEMICAL2DASH2,
+	EF_CHEMICAL2DASH3,
+	EF_ROLLINGCAST,
+	EF_WATER_BELOW,
+	EF_WATER_FADE,
+	EF_BEGINSPELL_N3,
+	EF_BEGINSPELL_N4,
+	EF_BEGINSPELL_N5,
+	EF_BEGINSPELL_N6,
+	EF_BEGINSPELL_N7,
+	EF_BEGINSPELL_N8,
+	EF_WATER_SMOKE,
+	EF_DANCE1,
+	EF_DANCE2,
+	EF_LINKPARTICLE,
+	EF_SOULLIGHT2,
+	EF_SPR_PARTICLE,
+	EF_SPR_PARTICLE2,
+	EF_SPR_PLANT,
+	EF_CHEMICAL_V,
+	EF_SHOOTPARTICLE,
+	EF_BOT_REVERB,
+	EF_RAIN_PARTICLE,
+	EF_CHEMICAL_V2,
+	EF_SECRA,
+	EF_BOT_REVERB2,
+	EF_CIRCLEPOWER2,
+	EF_SECRA2,
+	EF_CHEMICAL_V3,
+	EF_ENERVATION7,
+	EF_CIRCLEPOWER3,
+	EF_SPR_PLANT2,
+	EF_CIRCLEPOWER4,
+	EF_SPR_PLANT3,
+	EF_RG_COIN6,
+	EF_SPR_PLANT4,
+	EF_CIRCLEPOWER5,
+	EF_SPR_PLANT5,
+	EF_CIRCLEPOWER6,
+	EF_SPR_PLANT6,
+	EF_CIRCLEPOWER7,
+	EF_SPR_PLANT7,
+	EF_CIRCLEPOWER8,
+	EF_SPR_PLANT8,
+	EF_HEARTASURA,
+	EF_BEGINSPELL_150,
+	EF_LEVEL99_150,
+	EF_PRIMECHARGE,
+	EF_GLASSWALL4,
+	EF_GRADIUS_LASER,
+	EF_BASH3D6,
+	EF_GUMGANG5,
+	EF_HITLINE8,
+	EF_ELECTRIC4,
+	EF_TEIHIT1T,
+	EF_SPINMOVE,
+	EF_FIREBALL4,
+	EF_TRIPLEATTACK4,
+	EF_CHEMICAL3S,
+	EF_GROUNDSHAKE,
+	EF_DQ9_CHARGE,
+	EF_DQ9_CHARGE2,
+	EF_DQ9_CHARGE3,
+	EF_DQ9_CHARGE4,
+	EF_BLUELINE,
+	EF_SELFSCROLL,
+	EF_SPR_LIGHTPRINT,
+	EF_PNG_TEST,
+	EF_BEGINSPELL_YB,
+	EF_CHEMICAL2DASH4,
+	EF_GROUNDSHAKE2,
+	EF_PRESSURE2,
+	EF_RG_COIN7,
+	EF_PRIMECHARGE2,
+	EF_PRIMECHARGE3,
+	EF_PRIMECHARGE4,
+	EF_GREENCASTING,
+	EF_WALLOFTHORN,
+	EF_FIREBALL5,
+	EF_THROWITEM11,
+	EF_SPR_PLANT9,
+	EF_DEMONICFIRE,
+	EF_DEMONICFIRE2,
+	EF_DEMONICFIRE3,
+	EF_HELLSPLANT,
+	EF_FIREWALL2,
+	EF_VACUUM,
+	EF_SPR_PLANT10,
+	EF_SPR_LIGHTPRINT2,
+	EF_POISONSMOKE2,
+	EF_MAKEHALLU2,
+	EF_SHOCKWAVE2,
+	EF_SPR_PLANT11,
+	EF_COLDTHROW2,
+	EF_DEMONICFIRE4,
+	EF_PRESSURE3,
+	EF_LINKPARTICLE2,
+	EF_SOULLIGHT3,
+	EF_CHAREFFECT,
+	EF_GUMGANG6,
+	EF_FIREBALL6,
+	EF_GUMGANG7,
+	EF_GUMGANG8,
+	EF_GUMGANG9,
+	EF_BOTTOM_DE2,
+	EF_COLDSTATUS,
+	EF_SPR_LIGHTPRINT3,
+	EF_WATERBALL3,
+	EF_HEAL_N2,
+	EF_RAIN_PARTICLE2,
+	EF_CLOUD9,
+	EF_YELLOWFLY3,
+	EF_EL_GUST,
+	EF_EL_BLAST,
+	EF_EL_AQUAPLAY,
+	EF_EL_UPHEAVAL,
+	EF_EL_WILD_STORM,
+	EF_EL_CHILLY_AIR,
+	EF_EL_CURSED_SOIL,
+	EF_EL_COOLER,
+	EF_EL_TROPIC,
+	EF_EL_PYROTECHNIC,
+	EF_EL_PETROLOGY,
+	EF_EL_HEATER,
+	EF_POISON_MIST,
+	EF_ERASER_CUTTER,
+	EF_SILENT_BREEZE,
+	EF_MAGMA_FLOW,
+	EF_GRAYBODY,
+	EF_LAVA_SLIDE,
+	EF_SONIC_CLAW,
+	EF_TINDER_BREAKER,
+	EF_MIDNIGHT_FRENZY,
+	EF_MACRO,
+	EF_CHEMICAL_ALLRANGE,
+	EF_TETRA_FIRE,
+	EF_TETRA_WATER,
+	EF_TETRA_WIND,
+	EF_TETRA_GROUND,
+	EF_EMITTER,
+	EF_VOLCANIC_ASH,
+	EF_LEVEL99_ORB1,
+	EF_LEVEL99_ORB2,
+	EF_LEVEL150,
+	EF_LEVEL150_SUB,
+	EF_THROWITEM4_1,
+	EF_THROW_HAPPOKUNAI,
+	EF_THROW_MULTIPLE_COIN,
+	EF_THROW_BAKURETSU,
+	EF_ROTATE_HUUMARANKA,
+	EF_ROTATE_BG,
+	EF_ROTATE_LINE_GRAY,
+	EF_2011RWC,
+	EF_2011RWC2,
+	EF_KAIHOU,
+	EF_GROUND_EXPLOSION,
+	EF_KG_KAGEHUMI,
+	EF_KO_ZENKAI_WATER,
+	EF_KO_ZENKAI_LAND,
+	EF_KO_ZENKAI_FIRE,
+	EF_KO_ZENKAI_WIND,
+	EF_KO_JYUMONJIKIRI,
+	EF_KO_SETSUDAN,
+	EF_RED_CROSS,
+	EF_KO_IZAYOI,
+	EF_ROTATE_LINE_BLUE,
+	EF_KG_KYOMU,
+	EF_KO_HUUMARANKA,
+	EF_BLUELIGHTBODY,
+	EF_KAGEMUSYA,
+	EF_OB_GENSOU,
+	EF_NO100_FIRECRACKER,
+	EF_KO_MAKIBISHI,
+	EF_KAIHOU1,
+	EF_AKAITSUKI,
+	EF_ZANGETSU,
+	EF_GENSOU,
+	EF_HAT_EFFECT,
+	EF_CHERRYBLOSSOM,
+	EF_EVENT_CLOUD,
+	EF_RUN_MAKE_OK,
+	EF_RUN_MAKE_FAILURE,
+	EF_MIRESULT_MAKE_OK,
+	EF_MIRESULT_MAKE_FAIL,
+	EF_ALL_RAY_OF_PROTECTION,
+	EF_VENOMFOG,
+	EF_DUSTSTORM,
+	EF_LEVEL160,
+	EF_LEVEL160_SUB,
+	EF_MAPCHAIN,
+	EF_MAGIC_FLOOR,
+	EF_ICEMINE,
+	EF_FLAMECORSS,
+	EF_ICEMINE_1,
+	EF_DANCE_BLADE_ATK,
+	EF_DARKPIERCING,
+	EF_INVINCIBLEOFF2,
+	EF_MAXPAIN,
+	EF_DEATHSUMMON,
+	EF_MOONSTAR,
+	EF_STRANGELIGHTS,
+	EF_SUPER_STAR,
+	EF_YELLOBODY,
+	EF_COLORPAPER2,
+	EF_EVILS_PAW,
+	EF_GC_DARKCROW,
+	EF_RK_DRAGONBREATH_WATER,
+	EF_ALL_FULL_THROTTLE,
+	EF_SR_FLASHCOMBO,
+	EF_RK_LUXANIMA,
+	EF_CLOUD10,
+	EF_SO_ELEMENTAL_SHIELD,
+	EF_AB_OFFERTORIUM,
+	EF_WL_TELEKINESIS_INTENSE,
+	EF_GN_ILLUSIONDOPING,
+	EF_NC_MAGMA_ERUPTION,
+	EF_LG_KINGS_GRACE,
+	EF_BLOODDRAIN2,
+	EF_NPC_WIDEWEB,
+	EF_NPC_BURNT,
+	EF_NPC_CHILL,
+	EF_RA_UNLIMIT,
+	EF_AB_OFFERTORIUM_RING,
+	EF_SC_ESCAPE,
+	EF_WM_FRIGG_SONG,
+	EF_FLICKER,
+	EF_C_MAKER,
+	EF_HAMMER_OF_GOD,
+	EF_MASS_SPIRAL,
+	EF_FIRE_RAIN,
+	EF_WHITEBODY,
+	EF_BANISHING_BUSTER,
+	EF_SLUGSHOT,
+	EF_D_TAIL,
+	EF_BIND_TRAP1,
+	EF_BIND_TRAP2,
+	EF_BIND_TRAP3,
+	EF_JUMPBODY1,
+	EF_ANIMATED_EMITTER,
+	EF_RL_EXPLOSION,
+	EF_C_MAKER_1,
+	EF_QD_SHOT,
+	EF_P_ALTER,
+	EF_S_STORM,
+	EF_MUSIC_HAT,
+	EF_CLOUD_KILL,
+	EF_ESCAPE,
+	EF_XENO_SLASHER,
+	EF_FLOWERSMOKE,
+	EF_FSTONE,
+	EF_QSCARABA,
+	EF_LJOSALFAR,
+	EF_HAPPINESSSTAR,
+	EF_POWER_OF_GAIA,
+	EF_MAPLE_FALLS,
+	EF_MARKING_USE_CHANGEMONSTER,
+	EF_MAGICAL_FEATHER,
+	EF_MERMAID_LONGING,
+	EF_GIFT_OF_SNOW,
+	EF_ACH_COMPLETE,
+	EF_TIME_ACCESSORY,
+	EF_SPRITEMABLE,
+	EF_TUNAPARTY,
+	EF_FRESHSHRIMP,
+
+	EF_SU_GROOMING = 1123,
+	EF_SU_CHATTERING,
+
+	EF_FIREDANCE = 1133,
+	EF_RICHS_COIN_A,
+
+	EF_E_CHAIN = 1137,
+	EF_HEAT_BARREL,
+	EF_H_MINE,
+	EF_FALLEN_ANGEL,
+
+	EF_IMMUNE_PROPERTY = 1149,
+	EF_MOVE_COORDINATE,
+
+	EF_LIGHTSPHERE_SUN = 1197,
+	EF_LIGHTSPHERE_MOON,
+	EF_LIGHTSPHERE_STAR,
+
+	EF_NOVAEXPLOSING = 1202,
+	EF_STAR_EMPEROR,
+	EF_SMA_BLACK,
+
+	EF_ENERGYDRAIN_BLACK = 1208,
+	EF_BLINK_BODY,
+
+	EF_SOLARBURST = 1218,
+	EF_SJ_DOCUMENT,
+	EF_FALLING_STAR,
+
+	EF_STORMKICK8 = 1223,
+
+	EF_NEWMOON_KICK = 1229,
+	EF_FULLMOON_KICK,
+	EF_BOOK_OF_DIMENSION,
+
+	EF_CURSE_EXPLOSION = 1233,
+	EF_SOUL_REAPER,
+
+	EF_SOUL_EXPLOSION = 1242,
+	EF_MAX
+};
+
+enum e_hat_effects : int16{
+	HAT_EF_MIN = 0,
+	HAT_EF_BLOSSOM_FLUTTERING,
+	HAT_EF_MERMAID_LONGING,
+	HAT_EF_RL_BANISHING_BUSTER,
+	HAT_EF_LJOSALFAR,
+	HAT_EF_CLOCKING,
+	HAT_EF_SNOW,
+	HAT_EF_MAKEBLUR,
+	HAT_EF_SLEEPATTACK,
+	HAT_EF_GUMGANG,
+	HAT_EF_TALK_FROSTJOKE,
+	HAT_EF_DEMONSTRATION,
+	HAT_EF_FLUTTER_BUTTERFLY,
+	HAT_EF_ANGEL_FLUTTERING,
+	HAT_EF_BLESSING_OF_ANGELS,
+	HAT_EF_ELECTRIC,
+	HAT_EF_GREEN_FLOOR,
+	HAT_EF_SHRINK,
+	HAT_EF_VALHALLA_IDOL,
+	HAT_EF_ANGEL_STAIRS,
+	HAT_EF_GLOW_OF_NEW_YEAR,
+	HAT_EF_BOTTOM_FORTUNEKISS,
+	HAT_EF_PINKBODY,
+	HAT_EF_DOUBLEGUMGANG,
+	HAT_EF_GIANTBODY,
+	HAT_EF_GREEN99_6,
+	HAT_EF_CIRCLEPOWER,
+	HAT_EF_BOTTOM_BLOODYLUST,
+	HAT_EF_WATER_BELOW,
+	HAT_EF_LEVEL99_150,
+	HAT_EF_YELLOWFLY3,
+	HAT_EF_KAGEMUSYA,
+	HAT_EF_CHERRYBLOSSOM,
+	HAT_EF_STRANGELIGHTS,
+	HAT_EF_WL_TELEKINESIS_INTENSE,
+	HAT_EF_AB_OFFERTORIUM_RING,
+	HAT_EF_WHITEBODY2,
+	HAT_EF_SAKURA,
+	HAT_EF_CLOUD2,
+	HAT_EF_FEATHER_FLUTTERING,
+	HAT_EF_CAMELLIA_HAIR_PIN,
+	HAT_EF_JP_EV_EFFECT01,
+	HAT_EF_JP_EV_EFFECT02,
+	HAT_EF_JP_EV_EFFECT03,
+	HAT_EF_FLORAL_WALTZ,
+	HAT_EF_MAGICAL_FEATHER,
+	HAT_EF_HAT_EFFECT,
+	HAT_EF_BAKURETSU_HADOU,
+	HAT_EF_GOLD_SHOWER,
+	HAT_EF_WHITEBODY,
+	HAT_EF_WATER_BELOW2,
+	HAT_EF_FIREWORK,
+	HAT_EF_RETURN_TW_1ST_HAT,
+	HAT_EF_C_FLUTTERBUTTERFLY_BL,
+	HAT_EF_QSCARABA,
+	HAT_EF_FSTONE,
+	HAT_EF_MAGICCIRCLE,
+	HAT_EF_BRYSINGGAMEN,
+	HAT_EF_MAGINGIORDE,
+	HAT_EF_LEVEL99_RED,
+	HAT_EF_LEVEL99_ULTRAMARINE,
+	HAT_EF_LEVEL99_CYAN,
+	HAT_EF_LEVEL99_LIME,
+	HAT_EF_LEVEL99_VIOLET,
+	HAT_EF_LEVEL99_LILAC,
+	HAT_EF_LEVEL99_SUN_ORANGE,
+	HAT_EF_LEVEL99_DEEP_PINK,
+	HAT_EF_LEVEL99_BLACK,
+	HAT_EF_LEVEL99_WHITE,
+	HAT_EF_LEVEL160_RED,
+	HAT_EF_LEVEL160_ULTRAMARINE,
+	HAT_EF_LEVEL160_CYAN,
+	HAT_EF_LEVEL160_LIME,
+	HAT_EF_LEVEL160_VIOLET,
+	HAT_EF_LEVEL160_LILAC,
+	HAT_EF_LEVEL160_SUN_ORANGE,
+	HAT_EF_LEVEL160_DEEP_PINK,
+	HAT_EF_LEVEL160_BLACK,
+	HAT_EF_LEVEL160_WHITE,
+	HAT_EF_FULL_BLOOMCHERRY_TREE,
+	HAT_EF_C_BLESSINGS_OF_SOUL,
+	HAT_EF_MANYSTARS,
+	HAT_EF_SUBJECT_AURA_GOLD,
+	HAT_EF_SUBJECT_AURA_WHITE,
+	HAT_EF_SUBJECT_AURA_RED,
+	HAT_EF_C_SHINING_ANGEL_WING,
+	HAT_EF_MAGIC_STAR_TW,
+	HAT_EF_DIGITAL_SPACE,
+	HAT_EF_SLEIPNIR,
+	HAT_EF_C_MAPLE_WHICH_FALLS_RD,
+	HAT_EF_MAGICCIRCLERAINBOW,
+	HAT_EF_SNOWFLAKE_TIARA,
+	HAT_EF_MIDGARTS_GLORY,
+	HAT_EF_LEVEL99_TIGER,
+	HAT_EF_LEVEL160_TIGER,
+	HAT_EF_FLUFFYWING,
+	HAT_EF_C_GHOST_EFFECT,
+	HAT_EF_C_POPPING_PORING_AURA,
+	HAT_EF_RESONATETAEGO,
+	HAT_EF_99LV_RUNE_RED,
+	HAT_EF_99LV_ROYAL_GUARD_BLUE,
+	HAT_EF_99LV_WARLOCK_VIOLET,
+	HAT_EF_99LV_SORCERER_LBLUE,
+	HAT_EF_99LV_RANGER_GREEN,
+	HAT_EF_99LV_MINSTREL_PINK,
+	HAT_EF_99LV_ARCHBISHOP_WHITE,
+	HAT_EF_99LV_GUILL_SILVER,
+	HAT_EF_99LV_SHADOWC_BLACK,
+	HAT_EF_99LV_MECHANIC_GOLD,
+	HAT_EF_99LV_GENETIC_YGREEN,
+	HAT_EF_160LV_RUNE_RED,
+	HAT_EF_160LV_ROYAL_G_BLUE,
+	HAT_EF_160LV_WARLOCK_VIOLET,
+	HAT_EF_160LV_SORCERER_LBLUE,
+	HAT_EF_160LV_RANGER_GREEN,
+	HAT_EF_160LV_MINSTREL_PINK,
+	HAT_EF_160LV_ARCHB_WHITE,
+	HAT_EF_160LV_GUILL_SILVER,
+	HAT_EF_160LV_SHADOWC_BLACK,
+	HAT_EF_160LV_MECHANIC_GOLD,
+	HAT_EF_160LV_GENETIC_YGREEN,
+	HAT_EF_WATER_BELOW3,
+	HAT_EF_WATER_BELOW4,
+	HAT_EF_C_VALKYRIE_WING,
+	HAT_EF_2019RTC_CELEAURA_TW,
+	HAT_EF_2019RTC1ST_TW,
+	HAT_EF_2019RTC2ST_TW,
+	HAT_EF_2019RTC3ST_TW,
+	HAT_EF_CONS_OF_WIND,
+	HAT_EF_MAPLE_FALLS,
+	HAT_EF_BJ_HEADSETB,
+	HAT_EF_VIP_HAIR,
+	HAT_EF_C_MAGIC_HEIR_TW,
+	HAT_EF_C_SUDDEN_WEALTH_TW,
+	HAT_EF_C_ROMANCE_ROSE_TW,
+	HAT_EF_C_DISAPEAR_TIME_TW,
+	HAT_EF_2020RTC_01,
+	HAT_EF_2020RTC_02,
+	HAT_EF_2020RTC_03,
+	HAT_EF_C_2020RTC_IMP_TW,
+	HAT_EF_SUBJECT_AURA_BLACK,
+	HAT_EF_2020RTC_EFFECT_01,
+	HAT_EF_2020RTC_EFFECT_02,
+	HAT_EF_2020RTC_EFFECT_03,
+	HAT_EF_99LV_STAR_E_MBLUE,
+	HAT_EF_160LV_STAR_E_MBLUE,
+	HAT_EF_99LV_SOUL_R_GRAY,
+	HAT_EF_160LV_SOUL_R_GRAY,
+	HAT_EF_GEARWHEEL,
+	HAT_EF_GIFT_OF_SNOW,
+	HAT_EF_SNOW_POWDER,
+	HAT_EF_FALLING_SNOW,
+	HAT_EF_C_PHIGASIA_SCARF_EXE,
+	HAT_EF_C_KYEL_HYRE_ULTI_TW,
+	HAT_EF_C_MASTER,
+	HAT_EF_C_TIME_ACCESSORY,
+	HAT_EF_C_HELM_OF_RA,
+	HAT_EF_C_2021RTC_HEADSET_TW,
+	HAT_EF_C_MOONSTAR_ACCESSORY,
+	HAT_EF_BLACK_THUNDER,
+	HAT_EF_BLACK_THUNDER_DARK,
+	HAT_EF_C_RELEASED_GROUND,
+	HAT_EF_C_SAMBA_CARNIVAL,
+	HAT_EF_POISON_MASTER,
+	HAT_EF_C_SWIRLING_FLAME,
+	HAT_EF_C_2021RTC_HEADSET_1_TW,
+	HAT_EF_C_2021RTC_HEADSET_2_TW,
+	HAT_EF_C_2021RTC_HEADSET_3_TW,
+	HAT_EF_SUBJECT_AURA_WHITE_ALPHA,
+	HAT_EF_GC_DARKCROW,
+	HAT_EF_DIABOLUS_RING,
+	HAT_EF_MAGICCIRCLE_BLUE_TW,
+	HAT_EF_C_DISAPEAR_TIME_TW_2,
+	HAT_EF_C_MELODY_WING,
+	HAT_EF_C_SPOT_LIGHT,
+	HAT_EF_C_ASTRA_BLESSING,
+	HAT_EF_EFST_C_20TH_ANNIVERSARY_HAT,
+	HAT_EF_SUBJECT_AURA_NAVY,
+	HAT_EF_20TH_SCARF_J,
+	HAT_EF_GHOST_FIRE,
+	HAT_EF_MAX = 9999
+};
+
+enum e_convertpcinfo_type : uint8 {
+	CPC_NAME      = 0,
+	CPC_CHAR      = 1,
+	CPC_ACCOUNT   = 2
+};
+
+enum e_instance_warpall_flag{
+	IWA_NONE    = 0x00,
+	IWA_NOTDEAD = 0x01,
+};
+
+/**
+ * Player blocking actions related flags.
+ */
+enum e_pcblock_action_flag : uint16 {
+	PCBLOCK_MOVE     = 0x001,
+	PCBLOCK_ATTACK   = 0x002,
+	PCBLOCK_SKILL    = 0x004,
+	PCBLOCK_USEITEM  = 0x008,
+	PCBLOCK_CHAT     = 0x010,
+	PCBLOCK_IMMUNE   = 0x020,
+	PCBLOCK_SITSTAND = 0x040,
+	PCBLOCK_COMMANDS = 0x080,
+	PCBLOCK_NPCCLICK = 0x100,
+	PCBLOCK_NPC      = 0x18D,
+	PCBLOCK_EMOTION  = 0x200,
+	PCBLOCK_ALL      = 0x3FF,
+};
+
+/* getiteminfo/setiteminfo script commands */
+enum e_iteminfo : uint8 {
+	ITEMINFO_BUY = 0,
+	ITEMINFO_SELL,
+	ITEMINFO_TYPE,
+	ITEMINFO_MAXCHANCE,
+	ITEMINFO_GENDER,
+	ITEMINFO_LOCATIONS,
+	ITEMINFO_WEIGHT,
+	ITEMINFO_ATTACK,
+	ITEMINFO_DEFENSE,
+	ITEMINFO_RANGE,
+	ITEMINFO_SLOT,
+	ITEMINFO_VIEW,
+	ITEMINFO_EQUIPLEVELMIN,
+	ITEMINFO_WEAPONLEVEL,
+	ITEMINFO_ALIASNAME,
+	ITEMINFO_EQUIPLEVELMAX,
+	ITEMINFO_MAGICATTACK,
+	ITEMINFO_ID,
+	ITEMINFO_AEGISNAME,	// 18
+	ITEMINFO_ARMORLEVEL,
+	ITEMINFO_SUBTYPE,
+};
+
+class ConstantDatabase : public YamlDatabase {
+public:
+	ConstantDatabase() : YamlDatabase("CONSTANT_DB", 1) {
+
+	}
+
+	void clear() override{ }
+	const std::string getDefaultLocation() override;
+	uint64 parseBodyNode(const ryml::NodeRef& node) override;
+};
+
+#ifdef Pandas_ScriptCommand_SelfDeletion
+enum e_selfdeletion_flag : uint16 {
+	SELFDEL_CANCEL     = 0x00,
+	SELFDEL_NOW        = 0x01,
+	SELFDEL_WAITFREE   = 0x02
+};
+#endif // Pandas_ScriptCommand_SelfDeletion
+
+#ifdef Pandas_ScriptCommand_GetInventoryList
+enum e_inventory_query_flag : uint32{
+	INV_ID				= 0x0001,
+	INV_IDX				= 0x0002,
+	INV_AMOUNT			= 0x0004,
+	INV_EQUIP			= 0x0008,
+	INV_REFINE			= 0x0010,
+	INV_IDENTIFY		= 0x0020,
+	INV_ATTRIBUTE		= 0x0040,
+	INV_CARD			= 0x0080,
+	INV_EXPIRE			= 0x0100,
+	INV_BOUND			= 0x0200,
+	INV_ENCHANTGRADE	= 0x0400,
+	INV_OPTION			= 0x0800,
+	INV_TRADABLE		= 0x1000,
+	INV_FAVORITE		= 0x2000,
+	INV_UID				= 0x4000,
+	INV_EQUIPSWITCH		= 0x8000,
+	INV_ALL				= 0xFFFF
+};
+#endif // Pandas_ScriptCommand_GetInventoryList
+
+/**
+ * used to generate quick script_array entries
+ **/
+extern struct eri *array_ers;
+extern DBMap *st_db;
+extern unsigned int active_scripts;
+extern unsigned int next_id;
+extern struct eri *st_ers;
+extern struct eri *stack_ers;
+
+const char* skip_space(const char* p);
+void script_error(const char* src, const char* file, int start_line, const char* error_msg, const char* error_pos);
+void script_warning(const char* src, const char* file, int start_line, const char* error_msg, const char* error_pos);
+
+bool is_number(const char *p);
+struct script_code* parse_script(const char* src,const char* file,int line,int options);
+void run_script(struct script_code *rootscript,int pos,int rid,int oid);
+
+bool set_reg_num(struct script_state* st, map_session_data* sd, int64 num, const char* name, const int64 value, struct reg_db *ref);
+bool set_reg_str(struct script_state* st, map_session_data* sd, int64 num, const char* name, const char* value, struct reg_db* ref);
+bool set_var_str(map_session_data *sd, const char* name, const char* val);
+bool clear_reg( struct script_state* st, map_session_data* sd, int64 num, const char* name, struct reg_db *ref );
+int64 conv_num64(struct script_state *st, struct script_data *data);
+int conv_num(struct script_state *st, struct script_data *data);
+const char* conv_str(struct script_state *st,struct script_data *data);
+void pop_stack(struct script_state* st, int start, int end);
+TIMER_FUNC(run_script_timer);
+void script_stop_sleeptimers(int id);
+struct linkdb_node *script_erase_sleepdb(struct linkdb_node *n);
+void script_attach_state(struct script_state* st);
+#ifdef Pandas_ScriptEngine_MutliStackBackup
+void script_detach_state(struct script_state* st, bool dequeue_event);
+#endif // Pandas_ScriptEngine_MutliStackBackup
+void script_detach_rid(struct script_state* st);
+void run_script_main(struct script_state *st);
+
+void script_stop_scriptinstances(struct script_code *code);
+void script_free_code(struct script_code* code);
+void script_free_vars(struct DBMap *storage);
+struct script_state* script_alloc_state(struct script_code* rootscript, int pos, int rid, int oid);
+void script_free_state(struct script_state* st);
+
+struct DBMap* script_get_label_db(void);
+struct DBMap* script_get_userfunc_db(void);
+void script_run_autobonus(const char *autobonus, map_session_data *sd, unsigned int pos);
+void script_run_petautobonus(const std::string &autobonus, map_session_data &sd);
+
+const char* script_get_constant_str(const char* prefix, int64 value);
+bool script_get_parameter(const char* name, int64* value);
+bool script_get_constant(const char* name, int64* value);
+void script_set_constant_(const char* name, int64 value, const char* constant_name, bool isparameter, bool deprecated);
+#define script_set_constant(name, value, isparameter, deprecated) script_set_constant_(name, value, NULL, isparameter, deprecated)
+void script_hardcoded_constants(void);
+
+void script_cleararray_pc(map_session_data* sd, const char* varname);
+void script_setarray_pc(map_session_data* sd, const char* varname, uint32 idx, int64 value, int* refcache);
+
+int script_config_read(const char *cfgName);
+void do_init_script(void);
+void do_final_script(void);
+int add_str(const char* p);
+const char* get_str(int id);
+void script_reload(void);
+
+void setd_sub_num( struct script_state* st, map_session_data* sd, const char* varname, int elem, int64 value, struct reg_db* ref );
+void setd_sub_str( struct script_state* st, map_session_data* sd, const char* varname, int elem, const char* value, struct reg_db* ref );
+
+/**
+ * Array Handling
+ **/
+struct reg_db *script_array_src(struct script_state *st, map_session_data *sd, const char *name, struct reg_db *ref);
+void script_array_update(struct reg_db *src, int64 num, bool empty);
+void script_array_delete(struct reg_db *src, struct script_array *sa);
+void script_array_remove_member(struct reg_db *src, struct script_array *sa, unsigned int idx);
+void script_array_add_member(struct script_array *sa, unsigned int idx);
+unsigned int script_array_size(struct script_state *st, map_session_data *sd, const char *name, struct reg_db *ref);
+unsigned int script_array_highest_key(struct script_state *st, map_session_data *sd, const char *name, struct reg_db *ref);
+void script_array_ensure_zero(struct script_state *st, map_session_data *sd, int64 uid, struct reg_db *ref);
+int script_free_array_db(DBKey key, DBData *data, va_list ap);
+/* */
+void script_reg_destroy_single(map_session_data *sd, int64 reg, struct script_reg_state *data);
+int script_reg_destroy(DBKey key, DBData *data, va_list ap);
+/* */
+void script_generic_ui_array_expand(unsigned int plus);
+unsigned int *script_array_cpy_list(struct script_array *sa);
+
+bool script_check_RegistryVariableLength(int pType, const char *val, size_t* vlen);
+
+#ifdef Pandas_ScriptCommand_SelfDeletion
+TIMER_FUNC(selfdeletion_timer);
+void selfdeletion_exec_endtalk(struct script_state* st);
+void trade_tradeok(map_session_data* sd);
+void trade_tradecancel(map_session_data* sd);
+void trade_tradecommit(map_session_data* sd);
+void trade_tradeadditem(map_session_data* sd, short index, short amount);
+void trade_tradeaddzeny(map_session_data* sd, int amount);
+#endif // Pandas_ScriptCommand_SelfDeletion
+
+#endif /* SCRIPT_HPP */
