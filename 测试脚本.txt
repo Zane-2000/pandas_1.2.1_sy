@@ -1,0 +1,58 @@
+
+-	script	test	-1,{
+Oninit:
+	debugmes "测试NPC加载成功";
+	.syaid = 2000001;
+end;
+OnPCtraderequest:
+	if(getattachedrid() != .syaid){
+		end;
+	}
+		debugmes "收到来自["+@sy_trade_aid+"]交易请求.AID:["+getattachedrid()+"]";
+		@sy_traderequest_type = 1;
+end;
+OnPCtradeok:
+	unlockcmd;
+	sleep2 1000;
+	if(getattachedrid() != .syaid){
+		end;
+	}
+	debugmes "["+@sy_trade_aid+"]点击了确定按钮，交易物品已经锁定。:["+getattachedrid()+"]";
+	sy_getdealitem 2,.@zeny,.@itemid,.@itemcount;
+	if(.@zeny > 99){
+		.@count = .@zeny / 100;
+		getinventorylist(getcharid(0),INV_IDX|INV_AMOUNT|INV_ID);
+		for(.@a = 0 ; .@a < @inventorylist_count ; .@a++){
+			debugmes ""+.@a+":"+@inventorylist_id[.@a]+"     "+@inventorylist_amount[.@a];
+			if(@inventorylist_id[.@a] == 501){
+				.@idx = @inventorylist_idx[.@a];
+				.@maxcount = @inventorylist_amount[.@a];
+				debugmes "数量："+.@maxcount;
+				.@count = cap(.@count,1,.@maxcount);
+				sy_trade_tradeadditem .@idx,.@count;
+				.@tzeny = .@zeny - 100 * .@count;
+				sy_trade_tradeadditem -1,.@tzeny;
+				break;
+			}
+		}
+		debugmes ".@a:"+.@a;
+		if(.@a == @inventorylist_count){
+			debugmes "没有道具,关闭";
+			sy_trade_button 0;
+			end;
+		}
+	}
+	sleep2 1000;
+	sy_trade_button 1;
+end;
+OnPCtradercommit:
+	if(getattachedrid() != .syaid){
+		end;
+	}
+	debugmes "["+@sy_trade_aid+"]点击了交易按钮，可以开始交易。";
+	unlockcmd;
+	sleep2 1000;
+ sy_trade_button 2;
+	updateinventory();
+end;
+}
