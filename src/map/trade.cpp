@@ -88,7 +88,6 @@ void trade_traderequest(map_session_data *sd, map_session_data *target_sd)
 //	clif_traderequest(target_sd, sd->status.name);						//打开交易窗口
 
 //----------------------------------------收到交易请求事件------------------
-//-------------------------------------------------------------------------
 	{
 
 	pc_setreg(target_sd, add_str("@sy_trade_aid"), sd->status.account_id);					//发起交易的玩家AID
@@ -519,7 +518,6 @@ void trade_tradeok(map_session_data *sd)
 	clif_tradedeal_lock(target_sd, 1);
 
 //-------------------------------------------对面点击确认时触发的事件-------------------------------
-//-------------------------------------------------------------------------
 	pc_setreg(target_sd, add_str("@sy_trade_aid"), sd->status.account_id);					//发起交易的玩家AID
 	pc_setreg(target_sd, add_str("@sy_trade_cid"), sd->status.char_id);						//发起交易的玩家CID
 
@@ -620,7 +618,6 @@ void trade_tradecommit(map_session_data *sd)
 		{
 
 //-------------------------------------------对面点击交易时触发的事件-------------------------------
-//-------------------------------------------------------------------------
 				pc_setreg(tsd, add_str("@sy_trade_aid"), sd->status.account_id);					//发起交易的玩家AID
 				pc_setreg(tsd, add_str("@sy_trade_cid"), sd->status.char_id);						//发起交易的玩家CID
 
